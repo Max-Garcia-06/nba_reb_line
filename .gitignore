@@ -1,0 +1,26 @@
+# Secrets & credentials
+.env
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Generated data & trained models
+data/
+models/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Pytest
+.pytest_cache/
