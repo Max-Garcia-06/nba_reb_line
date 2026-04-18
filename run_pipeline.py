@@ -205,7 +205,7 @@ def scan(
     from edge_detector import scan_for_edges, execute_signals
     from kalshi_bridge import get_client
 
-    _header("Phase 5 — Edge Scan")
+    _header("Phase 4 — Edge Scan")
     game_date = game_date or datetime.today().strftime("%Y-%m-%d")
     edge_thr = threshold or EDGE_THRESHOLD
 
