@@ -64,12 +64,26 @@ class MarketLine:
     open_interest: int = 0
 
     @property
-    def mid_price(self) -> float:
+    def yes_mid(self) -> float:
         return round((self.yes_ask + self.yes_bid) / 2, 4)
 
     @property
+    def no_mid(self) -> float:
+        return round((self.no_ask + self.no_bid) / 2, 4)
+
+    @property
+    def yes_spread(self) -> float:
+        return round(self.yes_ask - self.yes_bid, 4)
+
+    @property
+    def no_spread(self) -> float:
+        return round(self.no_ask - self.no_bid, 4)
+
+    @property
     def implied_prob(self) -> float:
-        return self.mid_price
+        # Backwards-compatible: historically this code treated the YES mid as "market prob".
+        # Keep that behavior, but prefer yes_mid/no_mid explicitly in new logic.
+        return self.yes_mid
 
 
 @dataclass
@@ -81,6 +95,19 @@ class OrderResult:
     contracts: int
     price: float
     message: str = ""
+
+
+@dataclass
+class OpenOrder:
+    order_id: str
+    ticker: str
+    side: str
+    action: str
+    type: str
+    status: str
+    price: float
+    remaining_count: int
+    created_time: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -151,12 +178,55 @@ class KalshiClient:
         r.raise_for_status()
         return r.json()
 
-    def get_markets(self, series_ticker: str = "KXNBAREB", status: str = "open", limit: int = 200) -> list[dict]:
-        data = self._get("/markets", params={"series_ticker": series_ticker, "status": status, "limit": limit})
-        return data.get("markets", [])
+    def _delete(self, path: str, params: dict = None) -> dict:
+        url = f"{self.base_url}{path}"
+        r = self._session.delete(url, params=params, headers=self._auth_headers("DELETE", path), timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    def get_markets(
+        self,
+        series_ticker: str = "KXNBAREB",
+        status: str = "open",
+        limit: int = 200,
+        max_pages: int = 20,
+    ) -> list[dict]:
+        """
+        Fetch markets for a series, paginating via cursor.
+
+        Kalshi returns at most 200 markets per page. For series with lots of
+        markets (multi-day slates), today's games may appear on later pages.
+        """
+        markets: list[dict] = []
+        cursor: Optional[str] = None
+        pages = 0
+
+        while True:
+            params = {"series_ticker": series_ticker, "status": status, "limit": limit}
+            if cursor:
+                params["cursor"] = cursor
+            data = self._get("/markets", params=params)
+            batch = data.get("markets", []) or []
+            markets.extend(batch)
+
+            cursor = data.get("cursor")
+            pages += 1
+            if not cursor or not batch or pages >= max_pages:
+                break
+
+        return markets
 
     def get_rebound_lines(self, game_date: Optional[str] = None) -> list[MarketLine]:
-        return self.parse_rebound_markets(self.get_markets())
+        """
+        Return rebound markets, optionally filtered to a specific YYYY-MM-DD.
+
+        Note: Kalshi's markets endpoint doesn't support filtering by event date
+        for this series, so we fetch then filter based on parsed event_ticker.
+        """
+        lines = self.parse_rebound_markets(self.get_markets())
+        if not game_date:
+            return lines
+        return [ml for ml in lines if ml.game_date == game_date]
 
     def parse_rebound_markets(self, raw_markets: list[dict]) -> list[MarketLine]:
         """
@@ -251,11 +321,29 @@ class KalshiClient:
         return r.json()
 
     def place_order(self, ticker: str, side: str, contracts: int, price: float, order_type: str = "limit") -> OrderResult:
+        side_norm = (side or "").strip().lower()
         body = {
-            "ticker": ticker, "action": "buy", "side": side,
-            "count": contracts, "type": order_type,
-            "yes_price": int(round(price * 100)),
+            "ticker": ticker,
+            "action": "buy",
+            "side": side_norm,
+            "count": contracts,
+            "type": order_type,
         }
+        # Kalshi v2 expects side-specific price keys.
+        if side_norm == "yes":
+            body["yes_price"] = int(round(price * 100))
+        elif side_norm == "no":
+            body["no_price"] = int(round(price * 100))
+        else:
+            return OrderResult(
+                success=False,
+                order_id="",
+                ticker=ticker,
+                side=side,
+                contracts=contracts,
+                price=price,
+                message=f"Invalid side: {side!r}",
+            )
         try:
             data = self._post_order("/portfolio/orders", body)
             order = data.get("order", {})
@@ -266,6 +354,69 @@ class KalshiClient:
             log.error(f"Order failed for {ticker}: {e}")
             return OrderResult(success=False, order_id="", ticker=ticker, side=side,
                                contracts=contracts, price=price, message=str(e))
+
+    def get_orders(
+        self,
+        status: str = "resting",
+        ticker: Optional[str] = None,
+        limit: int = 200,
+    ) -> list[OpenOrder]:
+        """
+        Fetch your portfolio orders.
+        Common status for open orders is "resting".
+        """
+        params: dict = {"status": status, "limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        data = self._get("/portfolio/orders", params=params)
+        orders = []
+        for o in data.get("orders", []) or []:
+            side = (o.get("side") or "").lower()
+            # Price may come back as dollars or cents depending on API version.
+            price = None
+            if o.get("yes_price_dollars") is not None and side == "yes":
+                price = float(o["yes_price_dollars"])
+            elif o.get("no_price_dollars") is not None and side == "no":
+                price = float(o["no_price_dollars"])
+            elif o.get("yes_price") is not None and side == "yes":
+                price = float(o["yes_price"]) / 100
+            elif o.get("no_price") is not None and side == "no":
+                price = float(o["no_price"]) / 100
+            else:
+                # Fallback: some responses include a unified 'price' field.
+                if o.get("price") is not None:
+                    price = float(o["price"])
+            if price is None:
+                price = 0.0
+            orders.append(
+                OpenOrder(
+                    order_id=str(o.get("order_id", "")),
+                    ticker=str(o.get("ticker", "")),
+                    side=side,
+                    action=str(o.get("action", "")),
+                    type=str(o.get("type", "")),
+                    status=str(o.get("status", "")),
+                    price=float(price),
+                    remaining_count=int(o.get("remaining_count", o.get("count", 0)) or 0),
+                    created_time=str(o.get("created_time", "")),
+                )
+            )
+        return orders
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a specific order by order_id."""
+        try:
+            self._delete(f"/portfolio/orders/{order_id}")
+            return True
+        except requests.HTTPError as e:
+            log.error(f"Cancel failed for order_id={order_id}: {e}")
+            return False
+
+    def get_market(self, ticker: str) -> dict:
+        """Fetch a single market by ticker (used for settlement/result)."""
+        data = self._get(f"/markets/{ticker}")
+        # Docs return either {"market": {...}} or directly the market payload depending on version.
+        return data.get("market", data)
 
     def get_balance(self) -> float:
         data = self._get("/portfolio/balance")
@@ -300,7 +451,10 @@ class MockKalshiClient:
                 no_ask=round(1 - p["yes_bid"], 4), no_bid=round(1 - p["yes_ask"], 4),
                 volume=500 + i * 200, open_interest=1000 + i * 150,
             ))
-        return lines
+        # Mirror live behavior: if a date is requested, only return that date.
+        if not game_date:
+            return lines
+        return [ml for ml in lines if ml.game_date == game_date]
 
     def place_order(self, ticker: str, side: str, contracts: int, price: float, order_type: str = "limit") -> OrderResult:
         log.info(f"[MOCK] {ticker} | {side.upper()} x{contracts} @ {price:.2f}")
@@ -310,6 +464,12 @@ class MockKalshiClient:
             ticker=ticker, side=side, contracts=contracts, price=price,
             message="[Paper trade] Order simulated.",
         )
+
+    def get_orders(self, status: str = "resting", ticker: Optional[str] = None, limit: int = 200) -> list[OpenOrder]:
+        return []
+
+    def cancel_order(self, order_id: str) -> bool:
+        return True
 
     def get_balance(self) -> float:
         return 1000.0

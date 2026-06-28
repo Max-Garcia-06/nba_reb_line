@@ -21,6 +21,14 @@ EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.05"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 MAX_BET_PCT = float(os.getenv("MAX_BET_PCT", "0.02"))
 
+# Tail-risk controls (helps avoid brittle low-probability trades)
+# MIN_P: never trade if model win probability is below this.
+# TAIL_P_CUTOFF: probabilities below this are considered "tail" and require extra edge.
+# TAIL_EDGE_MULT: multiply EDGE_THRESHOLD by this factor when p < TAIL_P_CUTOFF.
+MIN_P = float(os.getenv("MIN_P", "0.12"))
+TAIL_P_CUTOFF = float(os.getenv("TAIL_P_CUTOFF", "0.20"))
+TAIL_EDGE_MULT = float(os.getenv("TAIL_EDGE_MULT", "1.5"))
+
 # Storage
 DB_PATH = os.getenv("DB_PATH", str(DATA_DIR / "nba_reb.db"))
 

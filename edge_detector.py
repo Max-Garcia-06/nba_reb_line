@@ -25,9 +25,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-from config import EDGE_THRESHOLD, KELLY_FRACTION, MAX_BET_PCT
+from config import EDGE_THRESHOLD, KELLY_FRACTION, MAX_BET_PCT, MIN_P, TAIL_P_CUTOFF, TAIL_EDGE_MULT
 from probability_engine import ProbabilityResult
 from kalshi_bridge import MarketLine, OrderResult, get_client
+from execution_engine import ExecutionLedger, LedgerKey, suggest_limit_price
+from trade_journal import TradeRow, append_row
 
 log = logging.getLogger(__name__)
 
@@ -50,13 +52,14 @@ class EdgeSignal:
     kalshi_line: float
     predicted_lambda: float
     p_model: float          # model's P(over)
-    p_market: float         # Kalshi's implied P(over)
+    p_market: float         # market price used for entry (YES ask or NO ask)
     edge: float             # p_model - p_market
     ev: float               # expected value per $1 risked
     kelly_f: float          # fractional Kelly stake (as fraction of bankroll)
     recommended_contracts: int
     recommended_side: str   # "yes" or "no"
     bet_dollars: float
+    limit_price: float      # limit price to send (<= model fair)
     flagged: bool = True    # True = strong edge; False = informational only
 
     def __repr__(self) -> str:
@@ -119,6 +122,9 @@ def detect_edge(
     bankroll: float,
     edge_threshold: float = EDGE_THRESHOLD,
     max_spread: float = MAX_BID_ASK_SPREAD,
+    min_p: float = MIN_P,
+    tail_p_cutoff: float = TAIL_P_CUTOFF,
+    tail_edge_mult: float = TAIL_EDGE_MULT,
 ) -> Optional[EdgeSignal]:
     """
     Compare model probability vs. market price; return EdgeSignal if edge found.
@@ -131,31 +137,42 @@ def detect_edge(
         log.warning("Safety switch is ON — skipping all trades.")
         return None
 
-    spread = market_line.yes_ask - market_line.yes_bid
-    if spread > max_spread:
-        log.debug(f"{market_line.ticker}: spread {spread:.2f} too wide, skipping")
-        return None
-
     p_model_over = prob_result.p_over
     p_model_under = prob_result.p_under
-    p_market_over = market_line.implied_prob
 
-    # Determine best side
-    over_edge = p_model_over - p_market_over
-    under_edge = p_model_under - (1.0 - p_market_over)
+    # Use side-specific entry prices (asks). This is where "NO is API-only" can matter:
+    # the NO ask can be stale/mispriced relative to 1-YES mid/ask.
+    yes_spread = market_line.yes_spread
+    no_spread = market_line.no_spread
 
-    if over_edge >= under_edge and over_edge > edge_threshold:
-        side = "yes"
-        p = p_model_over
-        c = market_line.yes_ask  # cost of "Yes" contract
-        edge = over_edge
-    elif under_edge > over_edge and under_edge > edge_threshold:
-        side = "no"
-        p = p_model_under
-        c = market_line.no_ask
-        edge = under_edge
-    else:
-        return None  # no edge
+    yes_edge = p_model_over - market_line.yes_ask
+    no_edge = p_model_under - market_line.no_ask
+
+    # Tail guardrails:
+    # - Hard floor: don't trade tiny probabilities at all.
+    # - Margin-of-safety: require a larger edge in the tails (probabilities near the floor).
+    def _effective_edge_threshold(p: float) -> float:
+        thr = edge_threshold
+        if p < tail_p_cutoff:
+            thr = thr * tail_edge_mult
+        return thr
+
+    # Determine best side, respecting per-side liquidity via spread
+    best = None
+    yes_thr = _effective_edge_threshold(p_model_over)
+    no_thr = _effective_edge_threshold(p_model_under)
+
+    if p_model_over >= min_p and yes_edge > yes_thr and yes_spread <= max_spread:
+        best = ("yes", p_model_over, market_line.yes_ask, yes_edge, yes_spread)
+    if p_model_under >= min_p and no_edge > no_thr and no_spread <= max_spread:
+        cand = ("no", p_model_under, market_line.no_ask, no_edge, no_spread)
+        if best is None or cand[3] > best[3]:
+            best = cand
+
+    if best is None:
+        return None
+
+    side, p, c, edge, spread = best
 
     # EV per $1 risked
     b = (1.0 - c) / c if c > 0 else 0.0
@@ -174,6 +191,15 @@ def detect_edge(
     bet_dollars = min(kf * bankroll, MAX_BET_PCT * bankroll)
     contracts = dollars_to_contracts(bet_dollars, c)
 
+    # Execution limit price: cap at fair, adjust for spread
+    if side == "yes":
+        bid, ask = market_line.yes_bid, market_line.yes_ask
+        model_fair = p_model_over
+    else:
+        bid, ask = market_line.no_bid, market_line.no_ask
+        model_fair = p_model_under
+    limit_price = suggest_limit_price(side=side, bid=bid, ask=ask, model_fair=model_fair)
+
     return EdgeSignal(
         player_name=prob_result.player_name,
         player_id=prob_result.player_id,
@@ -182,13 +208,14 @@ def detect_edge(
         kalshi_line=market_line.line,
         predicted_lambda=prob_result.predicted_lambda,
         p_model=p,
-        p_market=p_market_over if side == "yes" else (1.0 - p_market_over),
+        p_market=c,
         edge=edge,
         ev=ev,
         kelly_f=kf,
         recommended_contracts=contracts,
         recommended_side=side,
         bet_dollars=round(bet_dollars, 2),
+        limit_price=limit_price,
         flagged=True,
     )
 
@@ -198,6 +225,9 @@ def scan_for_edges(
     market_lines: list[MarketLine],
     bankroll: float,
     edge_threshold: float = EDGE_THRESHOLD,
+    min_p: float = MIN_P,
+    tail_p_cutoff: float = TAIL_P_CUTOFF,
+    tail_edge_mult: float = TAIL_EDGE_MULT,
 ) -> list[EdgeSignal]:
     """
     Match probability results to market lines by player name and line,
@@ -216,7 +246,15 @@ def scan_for_edges(
         if ml is None:
             log.debug(f"No market match for {pr.player_name} @ {pr.kalshi_line}")
             continue
-        signal = detect_edge(pr, ml, bankroll, edge_threshold)
+        signal = detect_edge(
+            pr,
+            ml,
+            bankroll,
+            edge_threshold=edge_threshold,
+            min_p=min_p,
+            tail_p_cutoff=tail_p_cutoff,
+            tail_edge_mult=tail_edge_mult,
+        )
         if signal:
             signals.append(signal)
 
@@ -231,28 +269,133 @@ def scan_for_edges(
 def execute_signals(
     signals: list[EdgeSignal],
     dry_run: bool = True,
+    todays_tickers: Optional[set[str]] = None,
+    cancel_stale: bool = True,
+    replace_if_price_diff: float = 0.02,
 ) -> list[OrderResult]:
     """
     Place orders for all flagged signals.
     dry_run=True logs without placing real orders.
     """
     client = get_client(force_mock=dry_run)
+    ledger = ExecutionLedger()
     results = []
 
+    desired = {(s.ticker, s.recommended_side): s for s in signals}
+
+    # In live mode, cancel stale open orders for today's markets that are no longer desired.
+    if not dry_run and cancel_stale and hasattr(client, "get_orders") and hasattr(client, "cancel_order"):
+        try:
+            open_orders = client.get_orders(status="resting", limit=200)
+        except Exception as e:
+            log.warning(f"Could not fetch open orders ({e}); skipping cancel/replace.")
+            open_orders = []
+
+        todays_tickers = todays_tickers or set()
+        for o in open_orders:
+            if todays_tickers and o.ticker not in todays_tickers:
+                continue
+            if (o.ticker, o.side) not in desired:
+                log.info(f"Cancelling stale open order: {o.ticker} {o.side.upper()} id={o.order_id} @ {o.price:.2f}")
+                client.cancel_order(o.order_id)
+
     for sig in signals:
+        key = LedgerKey(game_date=sig.game_date, ticker=sig.ticker, side=sig.recommended_side)
+        if ledger.has(key) and dry_run:
+            # In dry-run we keep the ledger behavior to reduce repeated spam.
+            log.info(f"Skipping duplicate (already attempted): {sig.ticker} {sig.recommended_side.upper()} {sig.game_date}")
+            continue
+
         if dry_run:
             log.info(f"[DRY RUN] {sig}")
+        ledger.add_attempt(
+            key,
+            price=sig.limit_price,
+            contracts=sig.recommended_contracts,
+            dollars=sig.bet_dollars,
+            note="pre-submit",
+            success=None,
+        )
+        append_row(
+            sig.game_date,
+            TradeRow(
+                game_date=sig.game_date,
+                ticker=sig.ticker,
+                side=sig.recommended_side,
+                action="buy",
+                contracts=sig.recommended_contracts,
+                limit_price=sig.limit_price,
+                order_id="",
+                player_name=sig.player_name,
+                kalshi_line=sig.kalshi_line,
+                predicted_lambda=sig.predicted_lambda,
+                p_model=sig.p_model,
+                edge=sig.edge,
+                ev=sig.ev,
+                note="pre-submit",
+                success=None,
+            ).to_dict(),
+        )
+
+        # Replace logic (live): if there's an existing resting order on the same ticker+side
+        # at a meaningfully different price, cancel it and submit the updated limit.
+        if not dry_run and hasattr(client, "get_orders") and hasattr(client, "cancel_order"):
+            try:
+                existing = [
+                    o for o in client.get_orders(status="resting", ticker=sig.ticker, limit=50)
+                    if o.side == sig.recommended_side
+                ]
+            except Exception:
+                existing = []
+            for o in existing:
+                if abs(o.price - sig.limit_price) >= replace_if_price_diff:
+                    log.info(
+                        f"Replacing order: {sig.ticker} {sig.recommended_side.upper()} "
+                        f"old={o.price:.2f} new={sig.limit_price:.2f} id={o.order_id}"
+                    )
+                    client.cancel_order(o.order_id)
+
         result = client.place_order(
             ticker=sig.ticker,
             side=sig.recommended_side,
             contracts=sig.recommended_contracts,
-            price=sig.p_market,
+            price=sig.limit_price,
         )
         if result.success:
             log.info(f"Order placed: {sig.ticker} | {sig.recommended_side.upper()} "
-                     f"x{sig.recommended_contracts} @ {sig.p_market:.2f}")
+                     f"x{sig.recommended_contracts} @ {sig.limit_price:.2f}")
         else:
             log.warning(f"Order failed: {result.message}")
+
+        ledger.add_attempt(
+            key,
+            price=sig.limit_price,
+            contracts=sig.recommended_contracts,
+            dollars=sig.bet_dollars,
+            note="post-submit",
+            order_id=result.order_id,
+            success=result.success,
+        )
+        append_row(
+            sig.game_date,
+            TradeRow(
+                game_date=sig.game_date,
+                ticker=sig.ticker,
+                side=sig.recommended_side,
+                action="buy",
+                contracts=sig.recommended_contracts,
+                limit_price=sig.limit_price,
+                order_id=result.order_id,
+                player_name=sig.player_name,
+                kalshi_line=sig.kalshi_line,
+                predicted_lambda=sig.predicted_lambda,
+                p_model=sig.p_model,
+                edge=sig.edge,
+                ev=sig.ev,
+                note="post-submit",
+                success=result.success,
+            ).to_dict(),
+        )
         results.append(result)
 
     return results

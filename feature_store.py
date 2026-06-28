@@ -345,6 +345,10 @@ def build_feature_table(
             trail_col = f"{col}_roll"
             gl[trail_col] = _trailing(gl, col, ROLLING_WINDOW)
 
+    # box_out_rate is not in nba_api tracking yet — roll is all-NaN until wired; use 0 for training/inference
+    if "box_out_rate_roll" in gl.columns:
+        gl["box_out_rate_roll"] = gl["box_out_rate_roll"].fillna(0)
+
     # Filter out players with too few games
     gl = gl[gl["games_played"] >= MIN_GAMES].copy()
 
@@ -376,6 +380,7 @@ def build_feature_table(
         "is_playoffs",
         "REB_CHANCE_PCT_ADJ_roll",
         "contested_reb_rate_roll",
+        "box_out_rate_roll",
     ]
 
     available = [c for c in feature_cols if c in gl.columns]
@@ -400,4 +405,5 @@ MODEL_FEATURES = [
     "is_playoffs",
     "REB_CHANCE_PCT_ADJ_roll",
     "contested_reb_rate_roll",
+    "box_out_rate_roll",
 ]

@@ -190,15 +190,19 @@ def scan(
     ),
     bankroll: float = typer.Option(1000.0, "--bankroll", help="Current bankroll in dollars."),
     threshold: float = typer.Option(None, "--threshold", help="Edge threshold override."),
+    min_p: float = typer.Option(None, "--min-p", help="Minimum model win probability to allow a trade."),
+    tail_p_cutoff: float = typer.Option(None, "--tail-p-cutoff", help="Probabilities below this are treated as tail and require extra edge."),
+    tail_edge_mult: float = typer.Option(None, "--tail-edge-mult", help="Multiply edge threshold by this factor in the tails."),
     max_signals: int = typer.Option(None, "--max-signals", help="Cap number of bets placed (best EV first)."),
     one_per_player: bool = typer.Option(False, "--one-per-player", help="Only take the best line per player."),
+    max_contracts: int = typer.Option(250, "--max-contracts", help="Cap contracts per market (risk control)."),
     dry_run: bool = typer.Option(True, "--dry-run/--live", help="Dry run (no orders placed)."),
 ):
     """
     Scan today's Kalshi rebound lines and detect +EV edges.
     Uses the trained model to predict λ and computes P(X > k).
     """
-    from config import EDGE_THRESHOLD
+    from config import EDGE_THRESHOLD, MIN_P, TAIL_P_CUTOFF, TAIL_EDGE_MULT
     from model import load_model, predict_lambda
     from feature_store import build_feature_table, MODEL_FEATURES
     from probability_engine import calculate_probabilities
@@ -208,10 +212,14 @@ def scan(
     _header("Phase 4 — Edge Scan")
     game_date = game_date or datetime.today().strftime("%Y-%m-%d")
     edge_thr = threshold or EDGE_THRESHOLD
+    min_p_eff = MIN_P if min_p is None else float(min_p)
+    tail_p_eff = TAIL_P_CUTOFF if tail_p_cutoff is None else float(tail_p_cutoff)
+    tail_mult_eff = TAIL_EDGE_MULT if tail_edge_mult is None else float(tail_edge_mult)
 
     console.print(f"Date      : {game_date}")
     console.print(f"Bankroll  : ${bankroll:,.2f}")
     console.print(f"Threshold : {edge_thr}")
+    console.print(f"Min P     : {min_p_eff:.3f}  (tail<{tail_p_eff:.3f} ⇒ edge×{tail_mult_eff:.2f})")
     console.print(f"Orders    : {'[yellow]DRY RUN[/yellow]' if dry_run else '[red]LIVE[/red]'}\n")
 
     # 1. Load model
@@ -229,13 +237,28 @@ def scan(
 
     if not market_lines:
         if hasattr(client, "get_markets"):
-            raw_count = len(client.get_markets())
+            raw = client.get_markets()
+            raw_count = len(raw)
             if raw_count > 0:
-                _warn(f"{raw_count} rebound markets exist but have no prices yet — run again ~1hr before tip-off.")
+                # Distinguish: (a) markets exist but none match requested date vs (b) truly no prices yet.
+                try:
+                    from kalshi_bridge import KalshiClient
+                    dates = sorted({KalshiClient._parse_game_date(m.get("event_ticker", "")) for m in raw})
+                except Exception:
+                    dates = []
+
+                if dates and game_date not in dates:
+                    _warn(
+                        f"{raw_count} rebound markets are open, but none match date {game_date}. "
+                        f"Available dates: {', '.join(dates[:5])}{'...' if len(dates) > 5 else ''}. "
+                        f"Try: --date {dates[0]}"
+                    )
+                else:
+                    _warn(f"{raw_count} rebound markets exist but have no prices yet — run again ~1hr before tip-off.")
             else:
-                _warn("No rebound markets found for today.")
+                _warn(f"No rebound markets found for date {game_date}.")
         else:
-            _warn("No rebound markets found for today.")
+            _warn(f"No rebound markets found for date {game_date}.")
         raise typer.Exit(0)
 
     console.print(f"Found {len(market_lines)} rebound markets on Kalshi\n")
@@ -301,7 +324,15 @@ def scan(
     console.print(t)
 
     # 6. Detect edges
-    signals = scan_for_edges(prob_results, market_lines, bankroll, edge_thr)
+    signals = scan_for_edges(
+        prob_results,
+        market_lines,
+        bankroll,
+        edge_threshold=edge_thr,
+        min_p=min_p_eff,
+        tail_p_cutoff=tail_p_eff,
+        tail_edge_mult=tail_mult_eff,
+    )
 
     if not signals:
         _warn(f"No edges found above threshold {edge_thr}.")
@@ -319,6 +350,12 @@ def scan(
     if max_signals and len(signals) > max_signals:
         signals = signals[:max_signals]
 
+    # Per-market contract cap (risk control)
+    if max_contracts:
+        for s in signals:
+            if s.recommended_contracts > max_contracts:
+                s.recommended_contracts = max_contracts
+
     # Scale bets so total deployed never exceeds bankroll
     total_raw = sum(s.bet_dollars for s in signals)
     if total_raw > bankroll:
@@ -326,7 +363,8 @@ def scan(
         from edge_detector import dollars_to_contracts
         for s in signals:
             s.bet_dollars = round(s.bet_dollars * scale, 2)
-            s.recommended_contracts = dollars_to_contracts(s.bet_dollars, s.p_market)
+            # Use limit_price rather than ask/mid for cost basis.
+            s.recommended_contracts = dollars_to_contracts(s.bet_dollars, s.limit_price)
 
     total_deployed = sum(s.bet_dollars for s in signals)
     console.print(f"\n[bold green]{len(signals)} edge(s) detected — ${total_deployed:.2f} total deployed:[/bold green]\n")
@@ -338,6 +376,7 @@ def scan(
     sig_table.add_column("Edge", justify="right")
     sig_table.add_column("EV", justify="right")
     sig_table.add_column("Contracts", justify="right")
+    sig_table.add_column("Limit", justify="right")
     sig_table.add_column("$Bet", justify="right")
 
     for s in signals:
@@ -348,6 +387,7 @@ def scan(
             f"[green]{s.edge:+.3f}[/green]",
             f"{s.ev:.3f}",
             str(s.recommended_contracts),
+            f"{s.limit_price:.2f}",
             f"${s.bet_dollars:.2f}",
         )
     sig_table.add_section()
@@ -357,7 +397,8 @@ def scan(
     # 7. Optionally execute
     if not dry_run:
         console.print("\n[bold red]LIVE MODE — placing orders...[/bold red]")
-        execute_signals(signals, dry_run=False)
+        todays_tickers = set(ml.ticker for ml in market_lines)
+        execute_signals(signals, dry_run=False, todays_tickers=todays_tickers, cancel_stale=True)
     else:
         _warn("Dry run — no orders placed. Use --live to execute.")
 
@@ -453,6 +494,143 @@ def backtest(
         _success(f"Positive ROI in backtest: {roi:.2f}%")
     else:
         _warn(f"Negative backtest ROI: {roi:.2f}%. Review features / threshold.")
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+@app.command()
+def report(
+    game_date: str = typer.Option(None, "--date", help="Game date YYYY-MM-DD. Defaults to today."),
+):
+    """
+    Summarize live trading performance from the JSONL trade journal.
+    If markets are resolved, fetch outcomes from Kalshi and compute realized P&L.
+    """
+    import json
+    from collections import defaultdict
+
+    from kalshi_bridge import get_client
+    from trade_journal import journal_path
+
+    game_date = game_date or datetime.today().strftime("%Y-%m-%d")
+    path = journal_path(game_date)
+    _header(f"Report — {game_date}")
+
+    if not path.exists():
+        _warn(f"No trade journal found at {path}")
+        raise typer.Exit(0)
+
+    rows = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+
+    # Only keep post-submit successful rows (one per order)
+    placed = [r for r in rows if r.get("note") == "post-submit" and r.get("success") is True]
+    if not placed:
+        _warn("No successful placed orders in journal for this date.")
+        raise typer.Exit(0)
+
+    client = get_client()
+
+    # Fetch settlement results for each ticker
+    by_ticker = {}
+    for r in placed:
+        t = r["ticker"]
+        if t in by_ticker:
+            continue
+        try:
+            m = client.get_market(t)
+        except Exception:
+            m = {}
+        by_ticker[t] = m
+
+    def outcome_for(ticker: str) -> str:
+        m = by_ticker.get(ticker, {}) or {}
+        # Kalshi uses 'result' as yes/no when resolved; may be empty if not determined.
+        res = (m.get("result") or "").lower()
+        return res
+
+    def pnl_per_contract(side: str, price: float, result: str) -> float | None:
+        if result not in {"yes", "no"}:
+            return None
+        win = (side == result)
+        return (1.0 - price) if win else (-price)
+
+    # Aggregate
+    realized_known = 0
+    realized_unknown = 0
+    total_cost = 0.0
+    total_contracts = 0
+    total_realized = 0.0
+
+    bucket = defaultdict(lambda: {"n": 0, "contracts": 0, "cost": 0.0, "pnl": 0.0, "known": 0})
+
+    for r in placed:
+        side = r.get("side", "")
+        price = float(r.get("limit_price", 0.0))
+        contracts = int(r.get("contracts", 0))
+        p_model = float(r.get("p_model", 0.0))
+        ticker = r.get("ticker", "")
+
+        total_cost += price * contracts
+        total_contracts += contracts
+
+        res = outcome_for(ticker)
+        pnlpc = pnl_per_contract(side, price, res)
+        if pnlpc is None:
+            realized_unknown += 1
+            continue
+        pnl = pnlpc * contracts
+        total_realized += pnl
+        realized_known += 1
+
+        # p bucket (by model probability)
+        p_bucket = f"{int(p_model*10)/10:.1f}-{int(p_model*10)/10 + 0.1:.1f}"
+        b = bucket[p_bucket]
+        b["n"] += 1
+        b["contracts"] += contracts
+        b["cost"] += price * contracts
+        b["pnl"] += pnl
+        b["known"] += 1
+
+    # Summary
+    console.print(f"Orders placed (successful): {len(placed)}")
+    console.print(f"Total contracts           : {total_contracts:,}")
+    console.print(f"Total cost (est)          : ${total_cost:,.2f}")
+    if realized_known > 0:
+        roi = (total_realized / total_cost) * 100 if total_cost > 0 else 0.0
+        console.print(f"Realized P&L (resolved)   : ${total_realized:,.2f}  (ROI {roi:.2f}%)")
+    if realized_unknown > 0:
+        _warn(f"{realized_unknown} order(s) not resolved yet (result unavailable). Re-run report later.")
+
+    # Bucket table
+    t = Table(title="Performance by p_model bucket (resolved only)", box=box.SIMPLE_HEAD)
+    t.add_column("p_model bucket", style="cyan")
+    t.add_column("Orders", justify="right")
+    t.add_column("Contracts", justify="right")
+    t.add_column("Cost", justify="right")
+    t.add_column("P&L", justify="right")
+    t.add_column("ROI", justify="right")
+
+    for k in sorted(bucket.keys()):
+        b = bucket[k]
+        if b["known"] <= 0:
+            continue
+        cost = b["cost"]
+        pnl = b["pnl"]
+        roi = (pnl / cost) * 100 if cost > 0 else 0.0
+        t.add_row(k, str(b["n"]), str(b["contracts"]), f"${cost:,.2f}", f"${pnl:,.2f}", f"{roi:.2f}%")
+
+    console.print(t)
 
 
 # ---------------------------------------------------------------------------
