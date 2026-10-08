@@ -22,7 +22,7 @@ KALSHI_ORDER_URL = os.getenv("KALSHI_ORDER_URL", "https://api.elections.kalshi.c
 KALSHI_SERIES = os.getenv("KALSHI_SERIES", "KXNBAREB")
 
 # Predictive core: a model_zoo candidate name (see bakeoff.py for how it was chosen)
-MODEL_FAMILY = os.getenv("MODEL_FAMILY", "c5_minutes_rate")
+MODEL_FAMILY = os.getenv("MODEL_FAMILY", "c7_ens_c4_c5")
 
 # Market blend: shrink model probabilities toward the market mid in logit space.
 # w=1 trusts the model fully (pre-July-2026 behavior); w=0 trusts the market.

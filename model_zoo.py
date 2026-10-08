@@ -293,6 +293,20 @@ class LGBMulticlass(Model):
         return p / p.sum(axis=1, keepdims=True)
 
 
+class Ensemble45(Model):
+    """C7 (production): equal-weight linear pool of C4 (NB-hetero) and C5 (minutes x rate).
+    Bake-off 2023-24..2025-26 (62,763 PIT rows): best line log-loss in every season,
+    -0.0007 vs C5 and -0.0008 vs C4 (date-clustered bootstrap CIs exclude 0)."""
+    name = "c7_ens_c4_c5"
+
+    def fit(self, df):
+        self.parts = [XGBNBHetero().fit(df), MinutesRate().fit(df)]
+        return self
+
+    def pmf(self, df):
+        return sum(m.pmf(df) for m in self.parts) / len(self.parts)
+
+
 CANDIDATES: dict[str, type[Model]] = {c.name: c for c in
                                       [NaiveNB, LegacyMAENB, XGBPoisson, XGBNB, XGBNBHetero,
-                                       MinutesRate, LGBMulticlass]}
+                                       MinutesRate, LGBMulticlass, Ensemble45]}

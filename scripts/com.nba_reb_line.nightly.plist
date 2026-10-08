@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.nba_reb_line.nightly</string>
+  <key>Comment</key>
+  <string>
+    Nightly etl/reconcile/report (plus refit-blend on Sundays). launchd, not cron:
+    cron drops triggers while the Mac sleeps; launchd runs a missed
+    StartCalendarInterval on next wake (lesson from mlb_tb_line). cron_job.sh
+    reconciles a 3-day lookback so a late run still covers the missed slate.
+
+    Hour/Minute are system-local (America/Los_Angeles): 01:30 PDT = 04:30 ET,
+    after West Coast games end and stats.nba.com box scores settle. Inside
+    mlb_tb_line's 22:50-07:50 keep-awake bridge.
+  </string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@@REPO@@/scripts/cron_job.sh</string>
+    <string>nightly</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>1</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>@@REPO@@/logs/cron.log</string>
+  <key>StandardErrorPath</key>
+  <string>@@REPO@@/logs/cron.log</string>
+</dict>
+</plist>

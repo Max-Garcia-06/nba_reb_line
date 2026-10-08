@@ -1,0 +1,27 @@
+# NBA Rebounds Pipeline — Phase 1 cron (books + dry-run scans; no live orders)
+# Install: scripts/install_phase1_cron.sh   (nightly runs under launchd, see below)
+#
+# @@REPO@@ = replaced with your repo path on install
+#
+# Hours are SYSTEM-LOCAL (America/Los_Angeles on this machine). The TZ=America/New_York
+# prefix only sets the job's environment (ET dates inside cron_job.sh), not the trigger,
+# so every hour below is ET minus 3. Same convention as the live mlb_tb_line crontab.
+#
+# Nightly (etl + reconcile + report, refit-blend on Sundays) is NOT here: cron skips
+# triggers while the Mac sleeps and never catches up. It runs from launchd
+# (scripts/com.nba_reb_line.nightly.plist), which fires a missed run on next wake.
+#
+# Power: don't add a second macOS repeat-wake alarm — macOS keeps one, and
+# mlb_tb_line's install_power_for_cron.sh owns it.
+
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# Books every 2h, 12:00-22:00 ET (-> 9 AM-7 PM PDT): full-slate scoring / refit-blend / backtest data
+0 9,11,13,15,17,19 * * * TZ=America/New_York @@REPO@@/scripts/cron_job.sh snapshot
+
+# Hourly dry-run scans 17:05-23:05 ET (-> 14:05-20:05 PDT); tips ~19:00-22:30 ET, SCAN_WITHIN_HOURS=1.5
+5 14-20 * * * TZ=America/New_York @@REPO@@/scripts/cron_job.sh scan
+
+# Watchdog: kill scan processes stuck >3h
+*/20 * * * * @@REPO@@/scripts/kill_stuck_scans.sh

@@ -101,7 +101,7 @@ def _market_rows_history(game_date: str, lead_min: int = HISTORY_LEAD_MIN) -> pd
         log.debug("history rows unavailable for %s: %s", game_date, e)
         return pd.DataFrame()
     mk = mk.merge(sch, on="teams_code", how="inner")
-    tip = pd.to_datetime(mk["TIP_UTC"], utc=True).astype("int64") // 10 ** 9
+    tip = pd.to_datetime(mk["TIP_UTC"], utc=True).dt.as_unit("s").astype("int64")  # unit-safe
     c = c.merge(pd.DataFrame({"ticker": mk["ticker"], "tip_ts": tip}), on="ticker")
     c = c[(c["end_ts"] <= c["tip_ts"] - lead_min * 60)].sort_values("end_ts").groupby("ticker").tail(1)
     return mk.drop(columns=["TIP_UTC", "teams_code"]).merge(c[["ticker", "yes_bid", "yes_ask"]], on="ticker")

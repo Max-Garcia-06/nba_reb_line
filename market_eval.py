@@ -93,7 +93,7 @@ def map_markets() -> pd.DataFrame:
 def snapshot(mk: pd.DataFrame, lead_min: int = 60) -> pd.DataFrame:
     c = pd.read_sql("SELECT ticker, end_ts, yes_bid, yes_ask, volume FROM kalshi_candles", _eng())
     tip = pd.to_datetime(mk.set_index("ticker")["TIP_UTC"], utc=True, errors="coerce")
-    tip_ts = (tip.astype("int64") // 10 ** 9).rename("tip_ts")
+    tip_ts = tip.dt.as_unit("s").astype("int64").rename("tip_ts")  # unit-safe (pandas 3 infers [s])
     c = c.merge(tip_ts, left_on="ticker", right_index=True)
     c = c[c["end_ts"] <= c["tip_ts"] - lead_min * 60]
     c = c[(c["yes_bid"] > 0) & (c["yes_ask"] < 1) & (c["yes_ask"] > c["yes_bid"])]

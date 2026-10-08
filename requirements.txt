@@ -5,8 +5,11 @@ numpy>=1.26.0
 
 # ML
 xgboost>=2.0.0
+lightgbm>=4.0.0
 scikit-learn>=1.4.0
 scipy>=1.12.0
+# Optional: USE_CVX_PORTFOLIO=true (simultaneous Kelly QP in capital_optimizer)
+# cvxpy>=1.4.0
 
 # Kalshi API
 requests>=2.31.0
