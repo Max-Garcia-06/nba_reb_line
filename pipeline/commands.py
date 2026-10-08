@@ -1751,10 +1751,7 @@ def fit_blend_segments(
         raise typer.Exit(2)
 
     _header(f"Fit segment blend weights — {start} → {end}")
-    _warn(
-        "Saved model may have trained on these dates (look-ahead in the model's favor). "
-        "Prefer dates after the model's training cutoff."
-    )
+    console.print("[dim]Scoring with point-in-time weekly models and calibrators (no look-ahead).[/dim]")
 
     rows = []
     d = start_d
@@ -1858,10 +1855,7 @@ def refit_blend(
 
     range_start, range_end = start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d")
     _header(f"Refit market-blend weight — {range_start} → {range_end}")
-    _warn(
-        "Saved model may have trained on these dates (look-ahead in the model's favor). "
-        "Prefer dates after the model's training cutoff."
-    )
+    console.print("[dim]Scoring with point-in-time weekly models and calibrators (no look-ahead).[/dim]")
 
     rows = []
     d = start_d

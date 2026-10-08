@@ -186,8 +186,11 @@ def _candle_window(m: dict, tip_utc: str | None) -> tuple[int, int]:
     """[max(open, tip-LOOKBACK), tip] — falls back to occurrence-3h when tip is unknown."""
     if tip_utc:
         end = _ts(tip_utc)
-    else:
+    elif isinstance(m.get("occurrence_time"), str):
         end = _ts(m["occurrence_time"]) - 3 * 3600
+    else:
+        # Postponed/rescheduled events can lack occurrence_time and a schedule match.
+        end = _ts(m["close_time"])
     start = max(_ts(m["open_time"]), end - LOOKBACK_HOURS * 3600)
     # Round to hour boundaries so the hourly candle that closes at tip is included.
     return start - start % 3600, end - end % 3600 + 3600

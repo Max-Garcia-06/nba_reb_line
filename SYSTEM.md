@@ -112,7 +112,38 @@ MLB's central finding was that the market beat the model and that unshrunk
 predictions against Kalshi's pregame mid (last hourly candle ≥60 min before
 tip, two-sided, spread ≤ 0.25) on every settled 2025-26 market.
 
-RESULTS_PLACEHOLDER
+**Raw model vs book** (`market_eval.py`, 17,034 markets, Nov 2025 – Jun 2026,
+bake-off monthly PIT predictions, uncalibrated):
+
+| Model | log-loss | Δ vs market (0.5186) | fitted w |
+|---|---|---|---|
+| c7 ensemble | 0.5192 | +0.0006 | 0.47 |
+| c4 NB-hetero | 0.5196 | +0.0010 | 0.46 |
+| c5 minutes × rate | 0.5199 | +0.0013 | 0.44 |
+| c1 legacy | 0.5254 | +0.0068 | 0.28 |
+| c0 naive | 0.5253 | +0.0067 | 0.27 |
+
+The new model roughly **ties** the market; the old one lost clearly. By
+disagreement bucket the model is at or slightly ahead of the book below 0.15
+and badly behind at ≥0.15 (ΔLL +0.057, n=539) — the same winner's-curse
+signature MLB found. Per-bucket blend weights exist for exactly this.
+
+**Blend weights** (`refit-blend`, PIT weekly models + PIT calibrators):
+
+| Window | global | <0.05 | 0.05–0.10 | 0.10–0.15 | ≥0.15 |
+|---|---|---|---|---|---|
+| Nov–Mar (fit for holdout test) | 0.33 | 0.67 | 0.37 | 0.33 | 0.09 |
+| Nov–Jun (production, 2026-10-08) | 0.40 | 0.73 | 0.46 | 0.44 | 0.14 |
+
+**Out-of-sample stack backtest** (Apr 1 – Jun 13 2026, weights fit on
+Nov–Mar only, full scan stack incl. fees, maker limits, Kelly, heuristic fill
+model): 82 trades, +$109.46 on $445.28, ROI +24.6% (day-bootstrap 95% CI
++7% to +41%). Treat as *suggestive, not proven*: n is small and mostly
+playoffs; the realised win rate (0.73) beat the model's own mean probability
+(0.68), which points at luck; the fill model ignores adverse selection on
+resting maker orders; and full-slate log-loss says the model only ties the
+market. The first weeks of 2026-27 should run dry-run, then small live,
+judged on net-of-fee P&L and CLV as in MLB §6.
 
 ## 6. Trading stack (ported from MLB, see MLB SYSTEM.md §3)
 
