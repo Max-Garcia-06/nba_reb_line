@@ -32,8 +32,8 @@ TAIL_EDGE_MULT = float(os.getenv("TAIL_EDGE_MULT", "1.5"))
 # Storage
 DB_PATH = os.getenv("DB_PATH", str(DATA_DIR / "nba_reb.db"))
 
-# NBA API seasons to pull (last 3)
-SEASONS = ["2022-23", "2023-24", "2024-25"]
+# NBA API seasons to pull. 2021-22 mainly supplies prior-season tracking for 2022-23.
+SEASONS = ["2021-22", "2022-23", "2023-24", "2024-25", "2025-26"]
 
 # Rolling window (games) for trailing features
 ROLLING_WINDOW = 10
