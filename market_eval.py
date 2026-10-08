@@ -28,8 +28,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import re
-import unicodedata
 
 import numpy as np
 import pandas as pd
@@ -37,19 +35,11 @@ from sqlalchemy import create_engine
 
 from bakeoff import _load_pmfs
 from config import DB_PATH
+from identity_bridge import norm_player_name as norm_name
 from model_zoo import prob_over
 
 MAX_SPREAD = 0.25
 TAKER_FEE = 0.07
-
-_SUFFIX = re.compile(r"\b(jr|sr|ii|iii|iv|v)\b")
-
-
-def norm_name(s: str) -> str:
-    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
-    s = re.sub(r"[^a-z ]", " ", s.lower().replace(".", "").replace("'", ""))
-    return " ".join(_SUFFIX.sub(" ", s).split())
-
 
 def _eng():
     return create_engine(f"sqlite:///{DB_PATH}")

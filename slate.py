@@ -102,7 +102,7 @@ def resolve_slate(market_lines: list, game_date: str) -> tuple[dict[str, SlateRo
             continue
         key = (norm_player_name(ml.player_name), g["game_id"])
         if key not in cache:
-            pool = rosters[rosters["TEAM_ID"].isin([g["home_team_id"], g["away_team_id"])]]
+            pool = rosters[rosters["TEAM_ID"].isin([g["home_team_id"], g["away_team_id"]])]
             pid = PlayerIndex(zip(pool["PLAYER_ID"], pool["PLAYER_NAME"])).resolve(ml.player_name)
             if not pid:
                 cache[key] = None
