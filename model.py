@@ -1,228 +1,180 @@
 """
 model.py
 --------
-XGBoost rebound regressor with walk-forward (time-series) cross-validation.
+Production wrapper around the model_zoo family chosen by the bake-off
+(config.MODEL_FAMILY). Persists the fitted model plus a meta record whose
+`trained_on` stamp identifies it; calibrators record the same stamp and
+calibrate_preflight refuses live trading on a mismatch.
 
-Training target : REB (actual total rebounds)
-Objective       : Minimize MAE
-Validation      : Walk-forward — train on months 1–N, test on month N+1
+Lessons carried over from mlb_tb_line (SYSTEM.md §9):
+  - A retrain silently invalidates calibrators fit against the old model's
+    probability distribution, so `train` refits the OOF calibrator itself.
+  - PIT backtests need `train_as_of(date)`: only rows strictly before `date`.
 
 Usage
 -----
-  python model.py train     # train and save model
-  python model.py evaluate  # print walk-forward CV results
+  python model.py train
+  python model.py evaluate      # same walk-forward as bakeoff, current family only
 """
+
+from __future__ import annotations
 
 import logging
 import pickle
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error
-from sklearn.model_selection import TimeSeriesSplit
-import xgboost as xgb
 
-from config import MODEL_DIR, ROLLING_WINDOW
-from feature_store import build_feature_table, MODEL_FEATURES
+from config import EVAL_LINES, MODEL_DIR, MODEL_FAMILY
+from feature_store import MODEL_FEATURES, build_feature_table
+from model_zoo import CANDIDATES, Model, TOP, prob_over
 
 log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-MODEL_PATH = MODEL_DIR / "xgb_rebound_model.pkl"
+MODEL_PATH = MODEL_DIR / "rebound_model.pkl"
 META_PATH = MODEL_DIR / "model_meta.pkl"
+OOF_MONTHS = 4
+OOF_LINE_WINDOW = 6.0
 
 
 # ---------------------------------------------------------------------------
-# XGBoost hyper-parameters
+# Data
 # ---------------------------------------------------------------------------
 
-XGB_PARAMS = dict(
-    n_estimators=1000,
-    learning_rate=0.02,
-    max_depth=6,
-    min_child_weight=3,
-    subsample=0.8,
-    colsample_bytree=0.7,
-    colsample_bylevel=0.7,
-    reg_alpha=0.05,
-    reg_lambda=1.5,
-    objective="reg:absoluteerror",   # directly minimises MAE
-    tree_method="hist",
-    random_state=42,
-)
-
-
-# ---------------------------------------------------------------------------
-# Data preparation
-# ---------------------------------------------------------------------------
-
-def prepare_data(df: Optional[pd.DataFrame] = None) -> tuple[pd.DataFrame, pd.Series]:
-    """
-    Load and clean feature table. Returns (X, y) with no NaN rows.
-    Rows are sorted by GAME_DATE to preserve temporal order.
-    """
+def prepare_data(df: Optional[pd.DataFrame] = None) -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame]:
     if df is None:
         df = build_feature_table()
-
-    df = df.dropna(subset=["REB"] + MODEL_FEATURES).copy()
-    df = df.sort_values("GAME_DATE").reset_index(drop=True)
-
-    X = df[MODEL_FEATURES]
-    y = df["REB"]
-    return X, y
+    if "_live" in df.columns:
+        df = df[~df["_live"]]
+    df = df[df["REB"].notna()].sort_values("GAME_DATE").reset_index(drop=True)
+    return df[MODEL_FEATURES], df["REB"].to_numpy(), df
 
 
-# ---------------------------------------------------------------------------
-# Walk-forward cross-validation
-# ---------------------------------------------------------------------------
-
-def walk_forward_cv(
-    X: pd.DataFrame,
-    y: pd.Series,
-    n_splits: int = 5,
-) -> dict:
-    """
-    TimeSeriesSplit cross-validation.
-    Returns dict with per-fold MAE and overall mean/std.
-    """
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    maes = []
-
-    for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-
-        model = xgb.XGBRegressor(**XGB_PARAMS)
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
-            verbose=False,
-        )
-
-        preds = model.predict(X_test)
-        mae = mean_absolute_error(y_test, preds)
-        maes.append(mae)
-        log.info(f"  Fold {fold + 1}/{n_splits} — MAE: {mae:.3f}")
-
-    result = {
-        "fold_maes": maes,
-        "mean_mae": float(np.mean(maes)),
-        "std_mae": float(np.std(maes)),
-    }
-    log.info(f"CV MAE: {result['mean_mae']:.3f} ± {result['std_mae']:.3f}")
-    return result
+def prepare_data_as_of(as_of_date: str, df: Optional[pd.DataFrame] = None):
+    """Training rows strictly before `as_of_date` (point-in-time)."""
+    X, y, dff = prepare_data(df)
+    keep = pd.to_datetime(dff["GAME_DATE"]) < pd.Timestamp(as_of_date)
+    return X[keep.values], y[keep.values], dff[keep.values].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
-# Training
+# Train / load
 # ---------------------------------------------------------------------------
 
-def train(df: Optional[pd.DataFrame] = None, save: bool = True) -> xgb.XGBRegressor:
-    """Train on all available data and optionally persist."""
-    X, y = prepare_data(df)
-    log.info(f"Training on {len(X):,} player-game rows, {len(MODEL_FEATURES)} features.")
-
-    model = xgb.XGBRegressor(**XGB_PARAMS)
-    model.fit(X, y, verbose=False)
-
-    # Store residual stats for Negative Binomial dispersion estimation
-    preds = model.predict(X)
-    residuals = y.values - preds
+def _fit(dff: pd.DataFrame, family: str) -> tuple[Model, dict]:
+    m = CANDIDATES[family]().fit(dff)
     meta = {
-        "features": MODEL_FEATURES,
-        "train_mean_y": float(y.mean()),
-        "residual_mean": float(residuals.mean()),
-        "residual_std": float(residuals.std()),
-        "residual_var": float(residuals.var()),
-        "train_rows": len(X),
+        "family": family,
+        "features": list(MODEL_FEATURES),
+        "train_rows": int(len(dff)),
+        "data_start": str(pd.to_datetime(dff["GAME_DATE"]).min().date()),
+        "data_end": str(pd.to_datetime(dff["GAME_DATE"]).max().date()),
+        "fitted_at": datetime.now(timezone.utc).isoformat(),
     }
+    # Identity stamp: data end date + fit time, so two fits on the same data differ.
+    meta["trained_on"] = f"{meta['data_end']}@{meta['fitted_at'][:19]}"
+    return m, meta
 
+
+def train(save: bool = True, family: str = MODEL_FAMILY, df: Optional[pd.DataFrame] = None,
+          fit_oof: bool = True) -> tuple[Model, dict]:
+    _, _, dff = prepare_data(df)
+    log.info(f"Training {family} on {len(dff):,} rows ({len(MODEL_FEATURES)} features)")
+    m, meta = _fit(dff, family)
     if save:
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
         with open(MODEL_PATH, "wb") as f:
-            pickle.dump(model, f)
+            pickle.dump(m, f)
         with open(META_PATH, "wb") as f:
             pickle.dump(meta, f)
-        log.info(f"Model saved to {MODEL_PATH}")
+        log.info(f"Saved {MODEL_PATH.name} (trained_on={meta['trained_on']})")
+        if fit_oof:
+            fit_and_save_oof_calibrator(dff, family=family, model_trained_on=meta["trained_on"])
+    return m, meta
 
-    return model, meta
+
+def train_as_of(as_of_date: str, family: str = MODEL_FAMILY, df: Optional[pd.DataFrame] = None):
+    _, _, dff = prepare_data_as_of(as_of_date, df)
+    return _fit(dff, family)
 
 
-# ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-
-def load_model() -> tuple[xgb.XGBRegressor, dict]:
+def load_model() -> tuple[Model, dict]:
     if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"No trained model at {MODEL_PATH}. Run: python model.py train")
+        raise FileNotFoundError(f"No trained model at {MODEL_PATH}. Run: python run_pipeline.py train")
     with open(MODEL_PATH, "rb") as f:
-        model = pickle.load(f)
+        m = pickle.load(f)
     with open(META_PATH, "rb") as f:
         meta = pickle.load(f)
-    return model, meta
+    return m, meta
 
 
-def predict_lambda(
-    features: dict | pd.DataFrame,
-    model: Optional[xgb.XGBRegressor] = None,
-) -> float | np.ndarray:
-    """
-    Predict the expected rebound mean (λ) for one or more player-game rows.
+def get_model_trained_on() -> str | None:
+    try:
+        with open(META_PATH, "rb") as f:
+            return pickle.load(f).get("trained_on")
+    except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+        return None
 
-    Parameters
-    ----------
-    features : dict (single row) or DataFrame (batch)
-    model    : pre-loaded model; loads from disk if None
 
-    Returns
-    -------
-    float (single) or np.ndarray (batch)
-    """
+def predict_pmf(df: pd.DataFrame, model: Optional[Model] = None) -> np.ndarray:
     if model is None:
         model, _ = load_model()
-
-    if isinstance(features, dict):
-        X = pd.DataFrame([features])[MODEL_FEATURES]
-        return float(max(0.0, model.predict(X)[0]))
-
-    X = features[MODEL_FEATURES]
-    return np.maximum(0.0, model.predict(X))
-
-
-def get_feature_importance(model: Optional[xgb.XGBRegressor] = None) -> pd.DataFrame:
-    if model is None:
-        model, _ = load_model()
-    scores = model.get_booster().get_score(importance_type="gain")
-    return (
-        pd.DataFrame(scores.items(), columns=["feature", "importance"])
-        .sort_values("importance", ascending=False)
-        .reset_index(drop=True)
-    )
+    return model.pmf(df)
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# OOF calibration rows (walk-forward, last OOF_MONTHS months)
 # ---------------------------------------------------------------------------
+
+def collect_oof_calibration_rows(dff: pd.DataFrame, family: str = MODEL_FAMILY,
+                                 months: int = OOF_MONTHS) -> list[dict]:
+    dff = dff.sort_values("GAME_DATE")
+    periods = sorted(pd.to_datetime(dff["GAME_DATE"]).dt.to_period("M").unique())[-months:]
+    rows: list[dict] = []
+    for per in periods:
+        start, end = per.start_time, per.end_time
+        tr = dff[dff["GAME_DATE"] < start]
+        te = dff[(dff["GAME_DATE"] >= start) & (dff["GAME_DATE"] <= end)]
+        if te.empty or len(tr) < 5000:
+            continue
+        pmf = CANDIDATES[family]().fit(tr).pmf(te)
+        ref = te["reb_roll"].fillna(te["reb_ewm"]).fillna(5.0).to_numpy()
+        for k in EVAL_LINES + [x + 1.0 for x in EVAL_LINES]:
+            m = np.abs(ref - k) <= OOF_LINE_WINDOW
+            if not m.any():
+                continue
+            p = prob_over(pmf[m], k)
+            y = (te["REB"].to_numpy()[m] > k).astype(float)
+            rows.extend({"p": float(a), "y": float(b), "line": float(k)} for a, b in zip(p, y))
+        log.info(f"  OOF {per}: train={len(tr):,} test={len(te):,}")
+    return rows
+
+
+def fit_and_save_oof_calibrator(dff: Optional[pd.DataFrame] = None, family: str = MODEL_FAMILY,
+                                model_trained_on: Optional[str] = None) -> bool:
+    from calibration import fit_oof_from_rows, save_oof
+
+    if dff is None:
+        _, _, dff = prepare_data()
+    rows = collect_oof_calibration_rows(dff, family)
+    cal = fit_oof_from_rows(rows, model_trained_on=model_trained_on or get_model_trained_on())
+    if cal is None:
+        log.warning(f"OOF calibrator not fit ({len(rows)} rows)")
+        return False
+    save_oof(cal)
+    log.info(f"Saved OOF calibrator from {len(rows):,} rows")
+    return True
+
 
 if __name__ == "__main__":
     import sys
 
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     cmd = sys.argv[1] if len(sys.argv) > 1 else "train"
-
     if cmd == "train":
-        model, meta = train()
-        print(f"\nTrain residual std (σ): {meta['residual_std']:.3f}")
-        print(f"Feature importance:")
-        print(get_feature_importance(model).to_string(index=False))
-
-    elif cmd == "evaluate":
-        X, y = prepare_data()
-        results = walk_forward_cv(X, y, n_splits=5)
-        print(f"\nWalk-forward CV  —  MAE: {results['mean_mae']:.3f} ± {results['std_mae']:.3f}")
-        league_avg = y.mean()
-        print(f"League avg rebounds: {league_avg:.2f}")
-        print(f"MAE as % of league avg: {results['mean_mae'] / league_avg * 100:.1f}%")
-
+        _, meta = train()
+        print(meta)
     else:
-        print(f"Unknown command: {cmd}. Use 'train' or 'evaluate'.")
+        print("usage: python model.py train  (evaluation lives in bakeoff.py)")

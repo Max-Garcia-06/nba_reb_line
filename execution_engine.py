@@ -1,13 +1,3 @@
-"""
-execution_engine.py
--------------------
-Execution utilities to make repeated runs safer and fills better:
-
-- Deduping: avoid re-buying same (date, ticker, side) across reruns.
-- Orderbook-aware limit pricing: choose a limit price using bid/ask + model fair.
-- Exposure caps: per-market max dollars/contracts.
-"""
-
 from __future__ import annotations
 
 import json
@@ -18,7 +8,6 @@ from typing import Optional
 
 from config import DATA_DIR
 
-
 LEDGER_PATH = Path(DATA_DIR) / "execution_ledger.json"
 TICK_SIZE = 0.01
 
@@ -28,7 +17,6 @@ def _utc_now_iso() -> str:
 
 
 def _round_to_tick(x: float) -> float:
-    # Kalshi prices are effectively in cents. Keep in [0.01, 0.99].
     x = round(round(x / TICK_SIZE) * TICK_SIZE, 2)
     return min(0.99, max(0.01, x))
 
@@ -41,11 +29,6 @@ class LedgerKey:
 
 
 class ExecutionLedger:
-    """
-    Simple JSON-backed ledger.
-    Stores keys we already attempted to trade so reruns don't double-buy.
-    """
-
     def __init__(self, path: Path = LEDGER_PATH):
         self.path = path
         self._data = {"version": 1, "entries": []}
@@ -56,7 +39,6 @@ class ExecutionLedger:
             if self.path.exists():
                 self._data = json.loads(self.path.read_text())
         except Exception:
-            # If corrupted, start fresh (don't brick execution).
             self._data = {"version": 1, "entries": []}
 
     def _save(self) -> None:
@@ -66,6 +48,18 @@ class ExecutionLedger:
     def has(self, key: LedgerKey) -> bool:
         k = {"game_date": key.game_date, "ticker": key.ticker, "side": key.side}
         return k in (e.get("key") for e in self._data.get("entries", []))
+
+    def has_successful_submit(self, key: LedgerKey) -> bool:
+        """True if we already logged a successful post-submit for this key (avoid duplicate live orders)."""
+        k = {"game_date": key.game_date, "ticker": key.ticker, "side": key.side}
+        for e in reversed(self._data.get("entries", [])):
+            if e.get("key") != k:
+                continue
+            if str(e.get("note", "")) != "post-submit":
+                continue
+            if e.get("success") is True:
+                return True
+        return False
 
     def add_attempt(
         self,
@@ -100,14 +94,8 @@ def suggest_limit_price(
     ask: float,
     model_fair: float,
     max_cross_spread: float = 0.06,
+    maker: bool = False,
 ) -> float:
-    """
-    Choose a limit price for a BUY.
-
-    - Never pay above model_fair (that would be negative EV by definition).
-    - If spread is tight, cross (use ask) up to model_fair to improve fill odds.
-    - If spread is wide, go passive near mid, still capped by model_fair.
-    """
     side = (side or "").lower()
     if side not in {"yes", "no"}:
         raise ValueError(f"Invalid side: {side!r}")
@@ -115,16 +103,17 @@ def suggest_limit_price(
     bid = float(bid)
     ask = float(ask)
     model_fair = float(model_fair)
-
     spread = max(0.0, ask - bid)
     mid = (ask + bid) / 2
 
     if spread <= max_cross_spread:
-        # Cross for fill, but never above fair.
         px = min(ask, model_fair)
     else:
-        # Go more passive: slightly above bid, but not above mid or fair.
         px = min(max(bid + TICK_SIZE, mid - TICK_SIZE), model_fair)
+
+    # Maker mode: never cross — rest at least one tick inside the ask (no taker fee).
+    if maker:
+        px = min(px, ask - TICK_SIZE)
 
     return _round_to_tick(px)
 

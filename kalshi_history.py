@@ -89,7 +89,7 @@ class _RateLimiter:
             time.sleep(t - now)
 
 
-_limiter = _RateLimiter(per_sec=12)
+_limiter = _RateLimiter(per_sec=5)  # unauthenticated historical endpoints 429 above ~5/s
 _session = requests.Session()
 
 
@@ -127,8 +127,8 @@ def parse_event_ticker(event_ticker: str) -> tuple[str | None, str | None]:
 
 
 def player_from_title(title: str) -> str:
-    # "Victor Wembanyama: 8+ rebounds"
-    return title.split(":")[0].strip() if ":" in title else title.strip()
+    # "Victor Wembanyama: 8+ rebounds" (newer) or "Dyson Daniels records 8+ rebounds" (older)
+    return re.split(r":| records ", title, maxsplit=1)[0].strip()
 
 
 def fetch_markets() -> pd.DataFrame:

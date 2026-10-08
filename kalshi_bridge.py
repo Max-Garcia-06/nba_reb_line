@@ -1,53 +1,59 @@
 """
-kalshi_bridge.py
-----------------
-Kalshi API client with RSA request signing (v2 auth) and a mock layer
-for offline development.
+kalshi_bridge.py (NBA rebounds)
+-------------------------------
+Kalshi API client with RSA request signing (v2 auth) and a mock layer.
 
-Auth flow
----------
-Kalshi v2 uses RSA-PSS signed requests, not a simple Bearer token.
-Each request is signed with your private key; Kalshi verifies with the
-public key you uploaded to the dashboard.
-
-Setup
------
-1. Generate a key pair:
-       openssl genrsa -out ~/.kalshi/private_key.pem 2048
-       openssl rsa -in ~/.kalshi/private_key.pem -pubout -out ~/.kalshi/public_key.pem
-
-2. Upload public_key.pem at demo.kalshi.co -> Settings -> API -> Create Key.
-   Copy the Key ID shown after upload.
-
-3. Add to .env:
-       KALSHI_API_KEY_ID=<key-id-from-dashboard>
-       KALSHI_PRIVATE_KEY_PATH=/Users/you/.kalshi/private_key.pem
-       KALSHI_BASE_URL=https://demo-api.kalshi.co/trade-api/v2
-
-Real API: https://demo-api.kalshi.co/trade-api/v2  (demo / paper)
-          https://trading-api.kalshi.com/trade-api/v2 (live)
+Ported back from mlb_tb_line, which had moved well past the original NBA
+client: v2 order API, live balance, /portfolio/fills reconciliation, single
+order lookup, signed trade sizes + VPIN batch.
 """
+
+from __future__ import annotations
 
 import base64
 import logging
 import re
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from config import KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH, KALSHI_BASE_URL, KALSHI_ORDER_URL
+from config import (
+    KALSHI_API_KEY_ID,
+    KALSHI_BASE_URL,
+    KALSHI_ORDER_URL,
+    KALSHI_PRIVATE_KEY_PATH,
+    KALSHI_SERIES,
+    REQUIRE_KALSHI_CREDENTIALS,
+)
+from flow_monitor import vpin_from_signed_volumes
 
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
+def read_price_from_market_dict(m: dict, dollars_key: str, cents_key: str) -> float:
+    """Read a Kalshi price field as dollars (supports *_dollars or cent integers)."""
+    if m.get(dollars_key) is not None:
+        try:
+            v = float(m[dollars_key])
+            return v if v > 0 else 0.0
+        except (TypeError, ValueError):
+            pass
+    if m.get(cents_key) is not None:
+        try:
+            return float(m[cents_key]) / 100.0
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
 
 @dataclass
 class MarketLine:
@@ -62,14 +68,13 @@ class MarketLine:
     no_bid: float
     volume: int = 0
     open_interest: int = 0
+    xref_player_id: str = ""
+    vpin_toxicity: float = 0.0
+    event_ticker: str = ""
 
     @property
     def yes_mid(self) -> float:
         return round((self.yes_ask + self.yes_bid) / 2, 4)
-
-    @property
-    def no_mid(self) -> float:
-        return round((self.no_ask + self.no_bid) / 2, 4)
 
     @property
     def yes_spread(self) -> float:
@@ -81,8 +86,6 @@ class MarketLine:
 
     @property
     def implied_prob(self) -> float:
-        # Backwards-compatible: historically this code treated the YES mid as "market prob".
-        # Keep that behavior, but prefer yes_mid/no_mid explicitly in new logic.
         return self.yes_mid
 
 
@@ -106,13 +109,10 @@ class OpenOrder:
     type: str
     status: str
     price: float
+    count: int
     remaining_count: int
     created_time: str = ""
 
-
-# ---------------------------------------------------------------------------
-# RSA signing
-# ---------------------------------------------------------------------------
 
 def _load_private_key(path: str):
     with open(path, "rb") as f:
@@ -120,11 +120,6 @@ def _load_private_key(path: str):
 
 
 def _sign(private_key, timestamp_ms: int, method: str, path: str) -> str:
-    """
-    Kalshi v2 signature:
-      message = f"{timestamp_ms}{method.upper()}/trade-api/v2{path}"
-    Signed with RSA-PSS SHA-256, base64-encoded.
-    """
     message = f"{timestamp_ms}{method.upper()}/trade-api/v2{path}".encode("utf-8")
     sig = private_key.sign(
         message,
@@ -137,13 +132,7 @@ def _sign(private_key, timestamp_ms: int, method: str, path: str) -> str:
     return base64.b64encode(sig).decode("utf-8")
 
 
-# ---------------------------------------------------------------------------
-# Live client
-# ---------------------------------------------------------------------------
-
 class KalshiClient:
-    """Kalshi REST API v2 with RSA-PSS signing."""
-
     def __init__(
         self,
         key_id: str = KALSHI_API_KEY_ID,
@@ -157,6 +146,13 @@ class KalshiClient:
         self._private_key = _load_private_key(private_key_path)
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
+        # Retry transient connect/read failures (DNS blips, resets, timeouts) on
+        # idempotent methods only (urllib3's default allowed_methods excludes POST,
+        # so order placement is never auto-retried and can't be double-submitted).
+        retry = Retry(total=3, backoff_factor=0.5, status_forcelist=(500, 502, 503, 504))
+        adapter = HTTPAdapter(max_retries=retry)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
 
     def _auth_headers(self, method: str, path: str) -> dict:
         ts = int(time.time() * 1000)
@@ -166,7 +162,7 @@ class KalshiClient:
             "KALSHI-ACCESS-SIGNATURE": _sign(self._private_key, ts, method, path),
         }
 
-    def _get(self, path: str, params: dict = None) -> dict:
+    def _get(self, path: str, params: dict | None = None) -> dict:
         url = f"{self.base_url}{path}"
         r = self._session.get(url, params=params, headers=self._auth_headers("GET", path), timeout=10)
         r.raise_for_status()
@@ -178,7 +174,7 @@ class KalshiClient:
         r.raise_for_status()
         return r.json()
 
-    def _delete(self, path: str, params: dict = None) -> dict:
+    def _delete(self, path: str, params: dict | None = None) -> dict:
         url = f"{self.base_url}{path}"
         r = self._session.delete(url, params=params, headers=self._auth_headers("DELETE", path), timeout=10)
         r.raise_for_status()
@@ -186,21 +182,14 @@ class KalshiClient:
 
     def get_markets(
         self,
-        series_ticker: str = "KXNBAREB",
+        series_ticker: str,
         status: str = "open",
         limit: int = 200,
         max_pages: int = 20,
     ) -> list[dict]:
-        """
-        Fetch markets for a series, paginating via cursor.
-
-        Kalshi returns at most 200 markets per page. For series with lots of
-        markets (multi-day slates), today's games may appear on later pages.
-        """
         markets: list[dict] = []
         cursor: Optional[str] = None
         pages = 0
-
         while True:
             params = {"series_ticker": series_ticker, "status": status, "limit": limit}
             if cursor:
@@ -208,97 +197,108 @@ class KalshiClient:
             data = self._get("/markets", params=params)
             batch = data.get("markets", []) or []
             markets.extend(batch)
-
             cursor = data.get("cursor")
             pages += 1
             if not cursor or not batch or pages >= max_pages:
                 break
-
         return markets
 
-    def get_rebound_lines(self, game_date: Optional[str] = None) -> list[MarketLine]:
-        """
-        Return rebound markets, optionally filtered to a specific YYYY-MM-DD.
-
-        Note: Kalshi's markets endpoint doesn't support filtering by event date
-        for this series, so we fetch then filter based on parsed event_ticker.
-        """
-        lines = self.parse_rebound_markets(self.get_markets())
+    def get_rebound_lines(self, game_date: Optional[str] = None, series_ticker: str = KALSHI_SERIES) -> list[MarketLine]:
+        raw = self.get_markets(series_ticker=series_ticker)
+        lines = self.parse_rebound_markets(raw)
         if not game_date:
             return lines
         return [ml for ml in lines if ml.game_date == game_date]
 
+    @staticmethod
+    def _xref_from_market(m: dict) -> str:
+        for k in (
+            "xref_player_id",
+            "xref_id",
+            "cross_ref_player_id",
+            "player_xref_id",
+            "custom_strike",
+        ):
+            v = m.get(k)
+            if v is None:
+                continue
+            if isinstance(v, dict):
+                for sub in ("basketball_player", "player_id", "id", "xref"):
+                    if v.get(sub) is not None:
+                        return str(v.get(sub)).strip()
+                continue
+            s = str(v).strip()
+            if s:
+                return s
+        return ""
+
     def parse_rebound_markets(self, raw_markets: list[dict]) -> list[MarketLine]:
-        """
-        Parse KXNBAREB markets. Title format: "Nikola Jokic: 10+ rebounds"
-        Only include markets that have live prices (yes_ask is not null).
-        """
-        lines = []
+        lines: list[MarketLine] = []
         for m in raw_markets:
-            title = m.get("title", "")
+            title = m.get("title", "") or ""
             if "rebound" not in title.lower():
                 continue
-            ticker = m.get("ticker", "")
+            ticker = m.get("ticker", "") or ""
             try:
-                # floor_strike is the authoritative line value when present
                 line = float(m["floor_strike"]) if m.get("floor_strike") is not None else self._extract_line_from_title(title)
                 player_name = self._extract_player_from_title(title)
+                xref = self._xref_from_market(m)
 
-                # API returns prices in two possible formats:
-                #   yes_ask_dollars / yes_bid_dollars  (0.00–1.00 USD, live)
-                #   yes_ask / yes_bid                  (0–100 cents, legacy)
+                # A missing side means no liquidity there: bid 0 / ask 1, so spread and
+                # realistic-ask gates drop it. (mlb_tb_line substitutes 0.50/0.48 here,
+                # which invents a two-sided book where none exists.)
                 def _price(dollars_key, cents_key, fallback):
-                    if m.get(dollars_key) is not None:
-                        v = float(m[dollars_key])
-                        return v if v > 0 else fallback
-                    if m.get(cents_key) is not None:
-                        return float(m[cents_key]) / 100
-                    return fallback
+                    v = read_price_from_market_dict(m, dollars_key, cents_key)
+                    return v if v > 0 else fallback
 
-                yes_ask = _price("yes_ask_dollars", "yes_ask", 0.50)
-                yes_bid = _price("yes_bid_dollars", "yes_bid", 0.48)
-                no_ask  = _price("no_ask_dollars",  "no_ask",  0.52)
-                no_bid  = _price("no_bid_dollars",  "no_bid",  0.50)
+                yes_ask = _price("yes_ask_dollars", "yes_ask", 1.0)
+                yes_bid = _price("yes_bid_dollars", "yes_bid", 0.0)
+                no_ask = _price("no_ask_dollars", "no_ask", 1.0)
+                no_bid = _price("no_bid_dollars", "no_bid", 0.0)
 
-                # Skip if both sides are still at resting quotes (no real market yet)
                 if yes_ask >= 0.99 and yes_bid <= 0.01:
-                    log.debug(f"No two-sided market yet for {ticker}")
                     continue
-                # event_ticker format: KXNBAREB-26APR10CLEATL → extract date
-                event_ticker = m.get("event_ticker", "")
+
+                event_ticker = m.get("event_ticker", "") or ""
                 game_date_str = self._parse_game_date(event_ticker)
-                lines.append(MarketLine(
-                    ticker=ticker, player_name=player_name, player_id=0,
-                    game_date=game_date_str, line=line,
-                    yes_ask=yes_ask, yes_bid=yes_bid,
-                    no_ask=no_ask, no_bid=no_bid,
-                    volume=int(m.get("volume", 0) or 0),
-                    open_interest=int(m.get("open_interest", 0) or 0),
-                ))
-            except (ValueError, KeyError, TypeError) as e:
-                log.debug(f"Skipping {ticker}: {e}")
+                lines.append(
+                    MarketLine(
+                        ticker=ticker,
+                        player_name=player_name,
+                        player_id=0,
+                        game_date=game_date_str,
+                        event_ticker=event_ticker,
+                        line=line,
+                        yes_ask=yes_ask,
+                        yes_bid=yes_bid,
+                        no_ask=no_ask,
+                        no_bid=no_bid,
+                        volume=int(float(m.get("volume_fp", m.get("volume", 0)) or 0)),
+                        open_interest=int(float(m.get("open_interest_fp", m.get("open_interest", 0)) or 0)),
+                        xref_player_id=xref,
+                        vpin_toxicity=0.0,
+                    )
+                )
+            except Exception:
+                continue
         return lines
 
     @staticmethod
     def _parse_game_date(event_ticker: str) -> str:
-        """
-        Extract date from event_ticker like KXNBAREB-26APR10CLEATL.
-        Format: YY + MMM + DD  e.g. 26APR10 → 2026-04-10
-        """
         match = re.search(r"(\d{2})([A-Z]{3})(\d{2})", event_ticker)
         if match:
             year, mon, day = match.groups()
-            months = {"JAN":"01","FEB":"02","MAR":"03","APR":"04","MAY":"05","JUN":"06",
-                      "JUL":"07","AUG":"08","SEP":"09","OCT":"10","NOV":"11","DEC":"12"}
-            return f"20{year}-{months.get(mon,'00')}-{day}"
+            months = {"JAN": "01", "FEB": "02", "MAR": "03", "APR": "04", "MAY": "05", "JUN": "06",
+                      "JUL": "07", "AUG": "08", "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12"}
+            return f"20{year}-{months.get(mon, '00')}-{day}"
         return datetime.today().strftime("%Y-%m-%d")
 
     @staticmethod
     def _extract_line_from_title(title: str) -> float:
-        # Format: "Player Name: 10+ rebounds"
-        match = re.search(r":?\s*(\d+\.?\d*)\+?\s*rebound", title, re.IGNORECASE)
+        # "Player Name: 8+ rebounds" -> line 7.5
+        match = re.search(r"(\d+\.?\d*)\+\s*rebounds?", title, re.IGNORECASE)
         if match:
-            return float(match.group(1)) - 0.5  # "10+" means >9.5
+            return float(match.group(1)) - 0.5
         match = re.search(r"(\d+\.5|\d+)", title)
         if match:
             return float(match.group(1))
@@ -306,15 +306,11 @@ class KalshiClient:
 
     @staticmethod
     def _extract_player_from_title(title: str) -> str:
-        # Format: "Player Name: 10+ rebounds" → "Player Name"
-        match = re.match(r"^([^:]+):", title)
-        if match:
-            return match.group(1).strip().title()
-        parts = re.split(r"\b(over|under|more|fewer|\d+\+)\b", title, flags=re.IGNORECASE)
-        return parts[0].strip().title() if parts else title.strip()
+        # "Victor Wembanyama: 8+ rebounds" or older "Dyson Daniels records 8+ rebounds".
+        # Keep original casing (".title()" turns LeBron into Lebron); identity_bridge normalises.
+        return re.split(r":| records ", title, maxsplit=1)[0].strip()
 
     def _post_order(self, path: str, body: dict) -> dict:
-        """POST to the order URL (demo for paper trading, live for real money)."""
         url = f"{self.order_url}{path}"
         r = self._session.post(url, json=body, headers=self._auth_headers("POST", path), timeout=10)
         r.raise_for_status()
@@ -322,49 +318,35 @@ class KalshiClient:
 
     def place_order(self, ticker: str, side: str, contracts: int, price: float, order_type: str = "limit") -> OrderResult:
         side_norm = (side or "").strip().lower()
+        # v2 API: bid = buy YES, ask = sell YES (= buy NO at 1 - price)
+        if side_norm == "yes":
+            book_side = "bid"
+            v2_price = f"{price:.4f}"
+        elif side_norm == "no":
+            book_side = "ask"
+            v2_price = f"{round(1.0 - price, 4):.4f}"
+        else:
+            return OrderResult(False, "", ticker, side, contracts, price, f"Invalid side: {side!r}")
         body = {
             "ticker": ticker,
-            "action": "buy",
-            "side": side_norm,
-            "count": contracts,
-            "type": order_type,
+            "side": book_side,
+            "count": str(contracts),
+            "price": v2_price,
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
         }
-        # Kalshi v2 expects side-specific price keys.
-        if side_norm == "yes":
-            body["yes_price"] = int(round(price * 100))
-        elif side_norm == "no":
-            body["no_price"] = int(round(price * 100))
-        else:
-            return OrderResult(
-                success=False,
-                order_id="",
-                ticker=ticker,
-                side=side,
-                contracts=contracts,
-                price=price,
-                message=f"Invalid side: {side!r}",
-            )
         try:
-            data = self._post_order("/portfolio/orders", body)
-            order = data.get("order", {})
-            return OrderResult(success=True, order_id=order.get("order_id", ""),
-                               ticker=ticker, side=side, contracts=contracts,
-                               price=price, message="Order placed")
+            data = self._post_order("/portfolio/events/orders", body)
+            return OrderResult(True, data.get("order_id", ""), ticker, side_norm, contracts, price, "Order placed")
         except requests.HTTPError as e:
-            log.error(f"Order failed for {ticker}: {e}")
-            return OrderResult(success=False, order_id="", ticker=ticker, side=side,
-                               contracts=contracts, price=price, message=str(e))
+            return OrderResult(False, "", ticker, side_norm, contracts, price, str(e))
+        except requests.RequestException as e:
+            # Network-level failure (timeout, connection reset/DNS) with no HTTP
+            # response — order state is unknown, but this must not crash the whole
+            # scan cycle. POST is never auto-retried, so no double-submit risk.
+            return OrderResult(False, "", ticker, side_norm, contracts, price, f"Network error: {e}")
 
-    def get_orders(
-        self,
-        status: str = "resting",
-        ticker: Optional[str] = None,
-        limit: int = 200,
-    ) -> list[OpenOrder]:
-        """
-        Fetch your portfolio orders.
-        Common status for open orders is "resting".
-        """
+    def get_orders(self, status: str = "resting", ticker: Optional[str] = None, limit: int = 200) -> list[OpenOrder]:
         params: dict = {"status": status, "limit": limit}
         if ticker:
             params["ticker"] = ticker
@@ -372,7 +354,6 @@ class KalshiClient:
         orders = []
         for o in data.get("orders", []) or []:
             side = (o.get("side") or "").lower()
-            # Price may come back as dollars or cents depending on API version.
             price = None
             if o.get("yes_price_dollars") is not None and side == "yes":
                 price = float(o["yes_price_dollars"])
@@ -382,10 +363,8 @@ class KalshiClient:
                 price = float(o["yes_price"]) / 100
             elif o.get("no_price") is not None and side == "no":
                 price = float(o["no_price"]) / 100
-            else:
-                # Fallback: some responses include a unified 'price' field.
-                if o.get("price") is not None:
-                    price = float(o["price"])
+            elif o.get("price") is not None:
+                price = float(o["price"])
             if price is None:
                 price = 0.0
             orders.append(
@@ -397,90 +376,236 @@ class KalshiClient:
                     type=str(o.get("type", "")),
                     status=str(o.get("status", "")),
                     price=float(price),
+                    count=int(o.get("count", 0) or 0),
                     remaining_count=int(o.get("remaining_count", o.get("count", 0)) or 0),
                     created_time=str(o.get("created_time", "")),
                 )
             )
         return orders
 
+    def get_order(self, order_id: str) -> dict:
+        """
+        Fetch a single order record. We keep this as a raw dict because Kalshi's schema
+        can change and different environments may expose different fields.
+        """
+        data = self._get(f"/portfolio/orders/{order_id}")
+        return data.get("order", data)
+
+    def get_fills(self, min_ts: int, max_ts: int, limit: int = 1000, max_pages: int = 20) -> list[dict]:
+        """
+        Raw fill records in the epoch-second window ``[min_ts, max_ts]``.
+
+        Kalshi purges ``/portfolio/orders/{id}`` after a few days but keeps fills, so
+        this is the only way to reconcile a journal whose nightly run was missed.
+        """
+        fills: list[dict] = []
+        cursor: Optional[str] = None
+        pages = 0
+        while True:
+            params: dict = {"min_ts": min_ts, "max_ts": max_ts, "limit": limit}
+            if cursor:
+                params["cursor"] = cursor
+            data = self._get("/portfolio/fills", params=params)
+            batch = data.get("fills", []) or []
+            fills.extend(batch)
+            cursor = data.get("cursor")
+            pages += 1
+            if not cursor or not batch or pages >= max_pages:
+                break
+        return fills
+
     def cancel_order(self, order_id: str) -> bool:
-        """Cancel a specific order by order_id."""
         try:
-            self._delete(f"/portfolio/orders/{order_id}")
+            self._delete(f"/portfolio/events/orders/{order_id}")
             return True
-        except requests.HTTPError as e:
-            log.error(f"Cancel failed for order_id={order_id}: {e}")
+        except requests.HTTPError:
             return False
 
     def get_market(self, ticker: str) -> dict:
-        """Fetch a single market by ticker (used for settlement/result)."""
         data = self._get(f"/markets/{ticker}")
-        # Docs return either {"market": {...}} or directly the market payload depending on version.
         return data.get("market", data)
 
+    def get_trade_signed_sizes(self, ticker: str, limit: int = 200) -> list[float]:
+        """
+        Best-effort signed trade sizes (+ buy, - sell) for VPIN. Returns [] if endpoint unavailable.
+        """
+        try:
+            data = self._get("/markets/trades", params={"ticker": ticker, "limit": int(limit)})
+        except Exception:
+            return []
+        out: list[float] = []
+        for t in data.get("trades", []) or []:
+            try:
+                cnt = float(t.get("count") or t.get("quantity") or 0)
+            except (TypeError, ValueError):
+                cnt = 0.0
+            if cnt <= 0:
+                continue
+            side = str(t.get("taker_side") or t.get("side") or "").lower()
+            if side in {"yes", "buy"}:
+                out.append(cnt)
+            elif side in {"no", "sell"}:
+                out.append(-cnt)
+            else:
+                out.append(cnt)
+        return out
+
+    def vpin_proxy(self, ticker: str, bucket: float = 400.0) -> float:
+        seq = self.get_trade_signed_sizes(ticker, limit=300)
+        if len(seq) < 5:
+            return 0.0
+        return float(vpin_from_signed_volumes(seq, bucket_target=bucket))
+
     def get_balance(self) -> float:
+        """
+        Available trading balance in dollars.
+
+        Kalshi v2 returns ``balance`` in cents at the top level (not a nested object).
+        """
         data = self._get("/portfolio/balance")
-        return float(data.get("balance", {}).get("available_balance", 0)) / 100
+        if not isinstance(data, dict):
+            return 0.0
+        bd = data.get("balance_dollars")
+        if bd is not None:
+            try:
+                return max(0.0, float(str(bd)))
+            except (TypeError, ValueError):
+                pass
+        bal = data.get("balance")
+        if isinstance(bal, (int, float)):
+            return max(0.0, float(bal) / 100.0)
+        if isinstance(bal, dict):
+            for key in ("available_balance", "balance", "available"):
+                v = bal.get(key)
+                if isinstance(v, (int, float)):
+                    return max(0.0, float(v) / 100.0)
+        for key in ("available_balance", "balance"):
+            v = data.get(key)
+            if isinstance(v, (int, float)):
+                return max(0.0, float(v) / 100.0)
+        return 0.0
 
 
-# ---------------------------------------------------------------------------
-# Mock client
-# ---------------------------------------------------------------------------
+def attach_vpin_proxy_batch(
+    client: object,
+    market_lines: list[MarketLine],
+    *,
+    max_workers: int = 8,
+) -> None:
+    """Fill ``vpin_toxicity`` on each line using concurrent per-ticker fetches."""
+    if not market_lines or not hasattr(client, "vpin_proxy"):
+        return
+
+    def _one(ml: MarketLine) -> tuple[str, float]:
+        try:
+            return ml.ticker, float(getattr(client, "vpin_proxy")(ml.ticker))
+        except Exception:
+            return ml.ticker, 0.0
+
+    with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
+        futures = {ex.submit(_one, ml): ml for ml in market_lines}
+        for fut in as_completed(futures):
+            ml = futures[fut]
+            try:
+                _, tox = fut.result()
+                ml.vpin_toxicity = float(tox)
+            except Exception:
+                ml.vpin_toxicity = 0.0
+
 
 class MockKalshiClient:
-    MOCK_PLAYERS = [
-        {"name": "Nikola Jokic",         "line": 12.5, "yes_ask": 0.58, "yes_bid": 0.56},
-        {"name": "Domantas Sabonis",      "line": 13.5, "yes_ask": 0.45, "yes_bid": 0.43},
-        {"name": "Anthony Davis",         "line": 11.5, "yes_ask": 0.52, "yes_bid": 0.50},
-        {"name": "Giannis Antetokounmpo", "line": 11.5, "yes_ask": 0.54, "yes_bid": 0.52},
-        {"name": "Rudy Gobert",           "line": 12.5, "yes_ask": 0.49, "yes_bid": 0.47},
-        {"name": "Bam Adebayo",           "line": 9.5,  "yes_ask": 0.51, "yes_bid": 0.49},
-        {"name": "Joel Embiid",           "line": 11.5, "yes_ask": 0.53, "yes_bid": 0.51},
-        {"name": "Karl-Anthony Towns",    "line": 9.5,  "yes_ask": 0.46, "yes_bid": 0.44},
+    MOCK = [
+        {"name": "Nikola Jokic", "line": 11.5, "yes_ask": 0.55, "yes_bid": 0.53},
+        {"name": "Domantas Sabonis", "line": 11.5, "yes_ask": 0.49, "yes_bid": 0.47},
+        {"name": "Victor Wembanyama", "line": 9.5, "yes_ask": 0.58, "yes_bid": 0.56},
     ]
 
-    def get_rebound_lines(self, game_date: Optional[str] = None) -> list[MarketLine]:
+    def get_rebound_lines(self, game_date: Optional[str] = None, series_ticker: str = KALSHI_SERIES) -> list[MarketLine]:
         date_str = game_date or datetime.today().strftime("%Y-%m-%d")
         lines = []
-        for i, p in enumerate(self.MOCK_PLAYERS):
+        for i, p in enumerate(self.MOCK):
             ticker = f"NBA-REB-{p['name'].upper().replace(' ', '-')}-{date_str}"
-            lines.append(MarketLine(
-                ticker=ticker, player_name=p["name"], player_id=i + 1,
-                game_date=date_str, line=p["line"],
-                yes_ask=p["yes_ask"], yes_bid=p["yes_bid"],
-                no_ask=round(1 - p["yes_bid"], 4), no_bid=round(1 - p["yes_ask"], 4),
-                volume=500 + i * 200, open_interest=1000 + i * 150,
-            ))
-        # Mirror live behavior: if a date is requested, only return that date.
+            lines.append(
+                MarketLine(
+                    ticker=ticker,
+                    player_name=p["name"],
+                    player_id=i + 1,
+                    game_date=date_str,
+                    line=p["line"],
+                    yes_ask=p["yes_ask"],
+                    yes_bid=p["yes_bid"],
+                    no_ask=round(1 - p["yes_bid"], 4),
+                    no_bid=round(1 - p["yes_ask"], 4),
+                    volume=500,
+                    open_interest=1000,
+                    xref_player_id="",
+                    vpin_toxicity=0.0,
+                )
+            )
         if not game_date:
             return lines
         return [ml for ml in lines if ml.game_date == game_date]
 
     def place_order(self, ticker: str, side: str, contracts: int, price: float, order_type: str = "limit") -> OrderResult:
         log.info(f"[MOCK] {ticker} | {side.upper()} x{contracts} @ {price:.2f}")
-        return OrderResult(
-            success=True,
-            order_id=f"mock-{ticker[:20]}-{datetime.now().timestamp():.0f}",
-            ticker=ticker, side=side, contracts=contracts, price=price,
-            message="[Paper trade] Order simulated.",
-        )
+        return OrderResult(True, f"mock-{int(datetime.now().timestamp())}", ticker, side, contracts, price, "mock")
 
     def get_orders(self, status: str = "resting", ticker: Optional[str] = None, limit: int = 200) -> list[OpenOrder]:
+        return []
+
+    def get_order(self, order_id: str) -> dict:
+        return {"order_id": order_id, "status": "mock", "count": 0, "remaining_count": 0}
+
+    def get_fills(self, min_ts: int, max_ts: int, limit: int = 1000, max_pages: int = 20) -> list[dict]:
         return []
 
     def cancel_order(self, order_id: str) -> bool:
         return True
 
+    def get_market(self, ticker: str) -> dict:
+        return {"ticker": ticker, "result": ""}
+
     def get_balance(self) -> float:
         return 1000.0
 
+    def get_trade_signed_sizes(self, ticker: str, limit: int = 200) -> list[float]:
+        return []
 
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
+    def vpin_proxy(self, ticker: str, bucket: float = 400.0) -> float:
+        return 0.0
+
 
 def get_client(force_mock: bool = False) -> KalshiClient | MockKalshiClient:
-    if force_mock or not KALSHI_API_KEY_ID or not KALSHI_PRIVATE_KEY_PATH:
-        log.info("Kalshi credentials not configured — using MockKalshiClient.")
+    if force_mock:
         return MockKalshiClient()
-    return KalshiClient()
+    key_id = str(KALSHI_API_KEY_ID).strip()
+    key_path = str(KALSHI_PRIVATE_KEY_PATH).strip()
+    if not key_id or not key_path:
+        if REQUIRE_KALSHI_CREDENTIALS:
+            raise RuntimeError(
+                "Kalshi credentials missing: set KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH in .env "
+                "(or unset REQUIRE_KALSHI_CREDENTIALS to allow the mock client)."
+            )
+        return MockKalshiClient()
+
+    pem = Path(key_path).expanduser()
+    if not pem.is_file():
+        msg = f"Kalshi private key file not found: {pem}"
+        if REQUIRE_KALSHI_CREDENTIALS:
+            raise FileNotFoundError(msg)
+        log.warning("%s — using mock Kalshi client.", msg)
+        return MockKalshiClient()
+
+    try:
+        return KalshiClient()
+    except OSError as e:
+        if REQUIRE_KALSHI_CREDENTIALS:
+            raise
+        log.warning("Kalshi client init failed (%s); using mock.", e)
+        return MockKalshiClient()
+    except Exception as e:
+        if REQUIRE_KALSHI_CREDENTIALS:
+            raise
+        log.warning("Kalshi client init failed (%s); using mock.", e, exc_info=True)
+        return MockKalshiClient()
+

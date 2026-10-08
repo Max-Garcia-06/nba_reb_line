@@ -23,7 +23,9 @@ Pull cadence:
 """
 
 import logging
+import re
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -207,6 +209,242 @@ def load_tracking_rebounds() -> pd.DataFrame:
 
 def load_schedule() -> pd.DataFrame:
     return _read("schedule")
+
+
+
+# ---------------------------------------------------------------------------
+# 5. Slate helpers for live scan (ported from mlb_tb_line; same contract)
+# ---------------------------------------------------------------------------
+
+# Schedule statuses where the game has started or finished (excluded from live scan).
+_STARTED_GAME_STATUSES = frozenset({"In Progress", "Final"})
+_STATUS_BY_CODE = {1: "Scheduled", 2: "In Progress", 3: "Final"}
+
+_EVENT_MATCHUP_RE = re.compile(r"^KX[A-Z]+-\d{2}[A-Z]{3}\d{2}([A-Z]{3})([A-Z]{3})$")
+
+
+def parse_kalshi_event_matchup(event_ticker: str) -> tuple[str, str] | None:
+    """
+    Parse away/home tricodes from a Kalshi NBA event ticker, e.g.
+    ``KXNBAREB-26JUN13NYKSAS`` -> (``NYK``, ``SAS``). NBA tricodes are always 3 letters.
+    """
+    m = _EVENT_MATCHUP_RE.match((event_ticker or "").strip())
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _parse_game_datetime_utc(raw: str) -> datetime | None:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _live_status_by_game_id() -> dict[str, str]:
+    """Today's game statuses from the NBA live scoreboard (empty on failure)."""
+    try:
+        from nba_api.live.nba.endpoints import scoreboard
+        games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
+        return {str(g["gameId"]): _STATUS_BY_CODE.get(int(g["gameStatus"]), "") for g in games}
+    except Exception as e:
+        log.warning(f"live scoreboard unavailable ({e}); falling back to stored schedule status")
+        return {}
+
+
+def slate_schedule_index(game_date: str) -> dict[str, dict]:
+    """
+    Map matchup slug (e.g. ``NYKSAS``) -> ``{status, start_utc, game_id, home_team_id,
+    away_team_id}`` for ``game_date`` (US/Eastern date), from the stored schedule
+    table with live status overlaid when available.
+    """
+    try:
+        sch = pd.read_sql(
+            text("SELECT * FROM schedule WHERE GAME_DATE_EST = :d"), _get_engine(), params={"d": game_date})
+    except Exception:
+        sch = pd.DataFrame()
+    if sch.empty:
+        season = season_for_date(game_date)
+        sch = fetch_schedule(season)
+        sch = sch[sch["GAME_DATE_EST"] == game_date]
+    live = _live_status_by_game_id()
+    out: dict[str, dict] = {}
+    for r in sch.itertuples():
+        status = live.get(str(r.GAME_ID)) or _STATUS_BY_CODE.get(int(r.GAME_STATUS or 1), "")
+        out[matchup_slug(r.AWAY_TRICODE, r.HOME_TRICODE)] = {
+            "status": status,
+            "start_utc": _parse_game_datetime_utc(str(r.TIP_UTC)),
+            "game_id": str(r.GAME_ID),
+            "home_team_id": int(r.HOME_TEAM_ID),
+            "away_team_id": int(r.AWAY_TEAM_ID),
+        }
+    return out
+
+
+def season_for_date(game_date: str) -> str:
+    """NBA season string for a date: Oct-Dec belong to the season starting that year."""
+    d = datetime.strptime(game_date, "%Y-%m-%d")
+    start = d.year if d.month >= 8 else d.year - 1
+    return f"{start}-{str(start + 1)[-2:]}"
+
+
+def matchup_slug(away_abbr: str, home_abbr: str) -> str:
+    return f"{away_abbr}{home_abbr}"
+
+
+def game_status_allows_scan(status: str) -> bool:
+    return (status or "").strip() not in _STARTED_GAME_STATUSES
+
+
+def _parse_game_datetime_utc(raw: str) -> datetime | None:
+    """Parse MLB ``game_datetime`` (e.g. ``2026-05-24T16:15:00Z``) to aware UTC."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _event_ticker_from_market_line(ml) -> str:
+    et = str(getattr(ml, "event_ticker", "") or "").strip()
+    if not et and getattr(ml, "ticker", ""):
+        parts = str(ml.ticker).split("-")
+        if len(parts) >= 2:
+            et = f"{parts[0]}-{parts[1]}"
+    return et
+
+def matchup_status_map(game_date: str) -> dict[str, str]:
+    """Map ``TEXCOL``-style keys to NBA schedule status for ``game_date`` (YYYY-MM-DD)."""
+    return {slug: str(row.get("status", "") or "") for slug, row in slate_schedule_index(game_date).items()}
+
+
+def matchup_start_time_map(game_date: str) -> dict[str, datetime]:
+    """Map matchup slug -> tip-off time (UTC) for ``game_date``."""
+    out: dict[str, datetime] = {}
+    for slug, row in slate_schedule_index(game_date).items():
+        start = row.get("start_utc")
+        if isinstance(start, datetime):
+            out[slug] = start
+    return out
+
+
+def filter_market_lines_by_start_window(
+    market_lines: list,
+    game_date: str,
+    *,
+    within_hours: float,
+    now: datetime | None = None,
+    schedule_index: dict[str, dict] | None = None,
+) -> tuple[list, list[tuple[str, str, str, str]]]:
+    """
+    Keep only markets whose NBA game tips within ``within_hours`` of ``now`` (UTC).
+
+    Returns ``(kept_lines, excluded)`` where each excluded entry is
+    ``(event_ticker, matchup_slug, game_datetime_iso, reason)``.
+    Unparseable event tickers or missing schedule rows are excluded (fail closed).
+    """
+    if within_hours <= 0:
+        return list(market_lines), []
+
+    now_utc = now or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(timezone.utc)
+
+    idx = schedule_index if schedule_index is not None else slate_schedule_index(game_date)
+    max_sec = float(within_hours) * 3600.0
+    kept: list = []
+    excluded: list[tuple[str, str, str, str]] = []
+    seen_events: set[str] = set()
+
+    for ml in market_lines:
+        et = _event_ticker_from_market_line(ml)
+        matchup = parse_kalshi_event_matchup(et) if et else None
+        if not matchup:
+            if et not in seen_events:
+                seen_events.add(et)
+                excluded.append((et, "", "", "unparseable_event"))
+            continue
+        key = matchup_slug(*matchup)
+        row = idx.get(key)
+        if not row:
+            if et not in seen_events:
+                seen_events.add(et)
+                excluded.append((et, key, "", "no_schedule"))
+            continue
+        start = row.get("start_utc")
+        if not isinstance(start, datetime):
+            if et not in seen_events:
+                seen_events.add(et)
+                excluded.append((et, key, "", "no_start_time"))
+            continue
+        start_utc = start.astimezone(timezone.utc)
+        delta_sec = (start_utc - now_utc).total_seconds()
+        start_iso = start_utc.isoformat().replace("+00:00", "Z")
+        if delta_sec < 0:
+            if et not in seen_events:
+                seen_events.add(et)
+                excluded.append((et, key, start_iso, "already_started"))
+            continue
+        if delta_sec > max_sec:
+            if et not in seen_events:
+                seen_events.add(et)
+                excluded.append((et, key, start_iso, "too_far"))
+            continue
+        kept.append(ml)
+
+    return kept, excluded
+
+
+def filter_market_lines_pregame(
+    market_lines: list,
+    game_date: str,
+    schedule_index: dict[str, dict] | None = None,
+) -> tuple[list, list[tuple[str, str, str]]]:
+    """
+    Drop markets tied to NBA games that have already started or finished.
+
+    Returns ``(kept_lines, excluded)`` where each excluded entry is
+    ``(event_ticker, matchup_slug, status)``.
+    """
+    if schedule_index is not None:
+        status_by_matchup = {slug: str(row.get("status", "") or "") for slug, row in schedule_index.items()}
+    else:
+        status_by_matchup = matchup_status_map(game_date)
+    kept: list = []
+    excluded: list[tuple[str, str, str]] = []
+    seen_events: set[str] = set()
+    for ml in market_lines:
+        et = _event_ticker_from_market_line(ml)
+        matchup = parse_kalshi_event_matchup(et) if et else None
+        if not matchup:
+            kept.append(ml)
+            continue
+        key = matchup_slug(*matchup)
+        status = status_by_matchup.get(key, "")
+        if not status or game_status_allows_scan(status):
+            kept.append(ml)
+            continue
+        if et not in seen_events:
+            seen_events.add(et)
+            excluded.append((et, key, status))
+    return kept, excluded
+
+
 
 
 if __name__ == "__main__":

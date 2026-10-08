@@ -264,7 +264,7 @@ def build_feature_table(
     pstate = player_state(gl, tg)
 
     targets = gl[["PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "GAME_ID", "GAME_DATE", "SEASON",
-                  "is_home", "is_playoffs", "REB"]].merge(
+                  "is_home", "is_playoffs", "REB", "MIN"]].merge(
         tg[["TEAM_ID", "GAME_ID", "OPP_TEAM_ID"]], on=["TEAM_ID", "GAME_ID"], how="left")
     targets["_live"] = False
     if extra_rows is not None and len(extra_rows):
@@ -272,6 +272,7 @@ def build_feature_table(
         ex["GAME_DATE"] = pd.to_datetime(ex["GAME_DATE"]).dt.normalize()
         ex["GAME_ID"] = ex["GAME_ID"].astype(str)
         ex["REB"] = np.nan
+        ex["MIN"] = np.nan
         ex["_live"] = True
         targets = pd.concat([targets, ex[targets.columns]], ignore_index=True)
 
@@ -327,4 +328,5 @@ def build_feature_table(
         keep = (df["games_played"] >= MIN_GAMES) & (df["min_roll"] >= MIN_TRAILING_MINUTES)
         df = df[~hist | keep]
 
-    return df[ID_COLS + ["_live", TARGET, "last_game_date"] + MODEL_FEATURES].reset_index(drop=True)
+    # MIN is an outcome (actual minutes), kept only as a training target — never a feature.
+    return df[ID_COLS + ["_live", TARGET, "MIN", "last_game_date"] + MODEL_FEATURES].reset_index(drop=True)
