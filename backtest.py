@@ -28,7 +28,7 @@ from typing import Any
 import pandas as pd
 
 from config import BACKTEST_FILL_MODEL, EDGE_THRESHOLD, MIN_P, TAIL_EDGE_MULT, TAIL_P_CUTOFF
-from edge_detector import apply_flow_guard, fill_calibrated_probabilities, scan_for_edges
+from edge_detector import apply_flow_guard, scan_for_edges
 from kalshi_bridge import MarketLine
 from probability_engine import calculate_probabilities
 from trading_stack import fill_probability, finalize_signals
@@ -136,7 +136,7 @@ def run_backtest_day(
               "games_played": int(feats.loc[(r.PLAYER_ID, r.GAME_ID), "games_played"])}
              for r in rows.itertuples()]
     prs = calculate_probabilities(preds)
-    fill_calibrated_probabilities(prs)
+    mvm.calibrate_results(prs, game_date, pit_train)
     lines = _market_lines(rows)
 
     signals = scan_for_edges(prs, lines, bankroll, edge_threshold=edge_threshold, min_p=min_p,

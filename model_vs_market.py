@@ -20,6 +20,11 @@ Differences from MLB
   present, else the Kalshi historical candles (kalshi_history.py).
 * Players are resolved to box scores by identity_bridge within the game;
   DNPs drop out (Kalshi settles those at the pregame fair price).
+* Calibration is point-in-time too: with pit_train the production OOF
+  calibrator (fit on the most recent months' outcomes) would be look-ahead for
+  any earlier day, and it moves probabilities by up to ~0.02. Each week gets
+  an isotonic calibrator fit on bakeoff.py's out-of-fold predictions dated
+  strictly before that week.
 """
 
 from __future__ import annotations
@@ -50,7 +55,9 @@ HISTORY_LEAD_MIN = 60
 PIT_CACHE = MODEL_DIR / "pit_cache"
 PIT_RETRAIN_DAYS = 7
 
+PIT_CALIB_MONTHS = 4
 _FEATURES: pd.DataFrame | None = None
+_PIT_CALS: dict[str, object] = {}
 
 
 @dataclass(frozen=True)
@@ -130,13 +137,61 @@ def _resolve(rows: pd.DataFrame, game_date: str) -> pd.DataFrame:
     return pd.DataFrame(out).drop(columns=["Index"], errors="ignore")
 
 
+def _week_start(game_date: str) -> str:
+    d = pd.Timestamp(game_date)
+    return (d - timedelta(days=d.weekday() % PIT_RETRAIN_DAYS)).strftime("%Y-%m-%d")
+
+
+def _pit_calibrator(game_date: str):
+    """Isotonic calibrator from OOF bake-off predictions in the PIT_CALIB_MONTHS before the week."""
+    from bakeoff import OUT_DIR, line_frame
+    from calibration import fit_oof_from_rows
+    from model_zoo import prob_over
+
+    as_of = _week_start(game_date)
+    if as_of in _PIT_CALS:
+        return _PIT_CALS[as_of]
+    path = OUT_DIR / f"{MODEL_FAMILY}.npz"
+    cal = None
+    if path.exists():
+        z = np.load(path)
+        idx = pd.MultiIndex.from_arrays([z["keys"][:, 0].astype(int), z["keys"][:, 1]])
+        f = _features().set_index(["PLAYER_ID", "GAME_ID"])
+        keep = idx.isin(f.index)
+        ff = f.loc[idx[keep]]
+        dates = pd.to_datetime(ff["GAME_DATE"]).to_numpy()
+        lo = pd.Timestamp(as_of) - pd.DateOffset(months=PIT_CALIB_MONTHS)
+        m = (dates < pd.Timestamp(as_of)) & (dates >= lo)
+        if m.sum() > 1000:
+            sub = ff[m].reset_index()
+            pmf = z["pmf"][keep][m]
+            lf = line_frame(sub)
+            p = prob_over(pmf[lf["row"].values], lf["line"].values)
+            y = (sub["REB"].to_numpy()[lf["row"].values] > lf["line"].values).astype(float)
+            cal = fit_oof_from_rows([{"p": a, "y": b} for a, b in zip(p, y)])
+    if cal is None:
+        log.warning("No PIT calibrator for week %s (need %s OOF rows) — scoring raw probabilities", as_of, path.name)
+    _PIT_CALS[as_of] = cal
+    return cal
+
+
+def calibrate_results(prs: list, game_date: str, pit_train: bool) -> None:
+    """PIT calibrator for historical scoring; the live calibrator stack otherwise."""
+    if not pit_train:
+        fill_calibrated_probabilities(prs)
+        return
+    cal = _pit_calibrator(game_date)
+    for pr in prs:
+        pr.p_over_calibrated = float(cal.transform(pr.p_over)) if cal is not None else float(pr.p_over)
+        pr.p_under_calibrated = 1.0 - pr.p_over_calibrated
+
+
 def _pit_model(game_date: str, pit_train: bool):
     from model import load_model, train_as_of
 
     if not pit_train:
         return load_model()[0]
-    d = pd.Timestamp(game_date)
-    as_of = (d - timedelta(days=d.weekday() % PIT_RETRAIN_DAYS)).strftime("%Y-%m-%d")
+    as_of = _week_start(game_date)
     path = PIT_CACHE / f"{MODEL_FAMILY}_{as_of}.pkl"
     if path.exists():
         with open(path, "rb") as f:
@@ -185,7 +240,7 @@ def evaluate_day(game_date: str, *, pit_train: bool = True, earliest: bool = Fal
               "games_played": int(feats.loc[(r.PLAYER_ID, r.GAME_ID), "games_played"])}
              for r in rows.itertuples()]
     prs = calculate_probabilities(preds)
-    fill_calibrated_probabilities(prs)
+    calibrate_results(prs, game_date, pit_train)
     return [ScoreRow(
         game_date=game_date, player_name=r.player_name, ticker=r.ticker, line=float(r.line),
         p_model_raw=float(pr.p_over),
