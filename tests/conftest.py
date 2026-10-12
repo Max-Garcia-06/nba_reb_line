@@ -1,4 +1,9 @@
+import os
+
 import pytest
+
+# Must run before any test imports config (conftest loads first).
+os.environ["NBA_REB_NO_DOTENV"] = "1"
 
 
 @pytest.fixture(autouse=True)

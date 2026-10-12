@@ -3,8 +3,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).parent
-# Only load env vars from this project folder (avoid picking up ../.env)
-load_dotenv(dotenv_path=BASE_DIR / ".env", override=False)
+# Only load env vars from this project folder (avoid picking up ../.env).
+# tests/conftest.py sets NBA_REB_NO_DOTENV so the suite runs on code defaults,
+# not on whatever risk limits and gates the live .env happens to hold.
+if not os.getenv("NBA_REB_NO_DOTENV"):
+    load_dotenv(dotenv_path=BASE_DIR / ".env", override=False)
 DATA_DIR = BASE_DIR / "data"
 MODEL_DIR = BASE_DIR / "models"
 DATA_DIR.mkdir(exist_ok=True)
