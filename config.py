@@ -181,6 +181,10 @@ CALIBRATE_MAX_AGE_DAYS = int(os.getenv("CALIBRATE_MAX_AGE_DAYS", "14"))
 # sizing off it. Set false to trade anyway (backtests and reports are unaffected
 # either way — the gate only applies when live=True).
 REQUIRE_FILL_CALIB_FOR_LIVE = os.getenv("REQUIRE_FILL_CALIB_FOR_LIVE", "true").lower() in ("1", "true", "yes")
+# Live scans refuse once the model's newest training game is this many days behind
+# the newest game in the DB (0 = off). Measured against the data, not the clock, so
+# the offseason never counts. Nightly retrains on Sundays keep this under ~8 days.
+MODEL_MAX_DATA_LAG_DAYS = int(os.getenv("MODEL_MAX_DATA_LAG_DAYS", "14"))
 
 # Live risk desk
 USE_LIVE_BALANCE = os.getenv("USE_LIVE_BALANCE", "true").lower() in ("1", "true", "yes")

@@ -13,6 +13,7 @@ from pathlib import Path
 from config import (
     CALIBRATE_MAX_AGE_DAYS,
     MODEL_DIR,
+    MODEL_MAX_DATA_LAG_DAYS,
     REQUIRE_FILL_CALIB_FOR_LIVE,
     USE_OOF_CALIBRATION,
     USE_SEGMENTED_CALIBRATION,
@@ -88,9 +89,56 @@ def _age_days(trained_at: str) -> float | None:
         return None
 
 
+def _model_data_end() -> str | None:
+    import pickle
+
+    from model import META_PATH
+
+    try:
+        with open(META_PATH, "rb") as f:
+            return pickle.load(f).get("data_end")
+    except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+        return None
+
+
+def _latest_game_date() -> str | None:
+    from sqlalchemy import text
+
+    from data_engine import _get_engine
+
+    try:
+        with _get_engine().connect() as conn:
+            d = conn.execute(text("SELECT MAX(GAME_DATE) FROM player_gamelogs")).scalar()
+    except Exception:
+        return None
+    return str(d)[:10] if d else None
+
+
+def model_data_lag_days() -> int | None:
+    """Days between the newest game in the DB and the newest game the model trained on."""
+    end, latest = _model_data_end(), _latest_game_date()
+    if not end or not latest:
+        return None
+    try:
+        return (datetime.strptime(latest, "%Y-%m-%d") - datetime.strptime(end[:10], "%Y-%m-%d")).days
+    except ValueError:
+        return None
+
+
 def check_calibrate_preflight(*, live: bool = False) -> CalibratePreflightResult:
     warnings: list[str] = []
     errors: list[str] = []
+
+    # mlb_tb_line ran 19 days on a model that predated an ETL fix, and the only
+    # signal was P&L. Retraining is cheap here, so a lagging model means the
+    # Sunday retrain stopped running: fail closed for live, like the calibrators.
+    lag = model_data_lag_days() if MODEL_MAX_DATA_LAG_DAYS > 0 else None
+    if lag is not None and lag > MODEL_MAX_DATA_LAG_DAYS:
+        msg = (
+            f"Model is {lag}d behind the data (trained through {_model_data_end()}, "
+            f"limit {MODEL_MAX_DATA_LAG_DAYS}d); run train"
+        )
+        (errors if live else warnings).append(msg)
 
     from model import get_model_trained_on
 

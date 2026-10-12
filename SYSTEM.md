@@ -185,7 +185,11 @@ processes.
 
 ## 9. Known gaps
 
-* Retraining has no schedule (same as MLB). Retrain weekly early in the season.
+* Retraining runs Sundays inside `nightly` (MLB still has none — its fit takes ~11h).
+  It invalidates the fill calibrator, so set `AUTO_RETRAIN=0` before turning on
+  `REQUIRE_FILL_CALIB_FOR_LIVE`, then retrain by hand and recalibrate together.
+* Live rosters (PlayerIndex) are a snapshot of now: same-day trades show up only
+  once stats.nba.com updates them; until then the player is skipped or on his old team.
 * Injury feed is unofficial (ESPN JSON) and fails open (vacuum = 0, logged).
 * No hyper-parameter tuning was ported (`tune`); model_zoo params are hand-set.
 * Fill-based calibrator and segment blocks need NBA fills that don't exist yet.

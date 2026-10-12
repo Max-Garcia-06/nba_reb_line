@@ -57,8 +57,14 @@ breaches create it automatically (`AUTO_KILL_ON_RISK_BREACH=true`).
 ```
 
 Early season: players' rolling windows reach back into last season; `games_in_season`
-and prior-season tracking tell the model how stale that is. Retrain weekly for the first
-month (`train`), then every 2–4 weeks — there is still no cron for retraining.
+and prior-season tracking tell the model how stale that is. `nightly` retrains every
+Sunday (`AUTO_RETRAIN`, ~1 min); live scans refuse once the model trails the newest DB
+game by `MODEL_MAX_DATA_LAG_DAYS` (14), so a retrain that silently stops can't go unnoticed.
+
+Offseason moves: on today/future slates `slate.recent_rosters` takes each player's team
+from today's league rosters (nba_api PlayerIndex), not his last game — otherwise every
+player who changed teams is skipped (or, if his old team is in the game, mispriced) until
+he plays for the new one. Historical dates and API failures fall back to last-played team.
 
 ## 4. Game day
 
@@ -67,7 +73,7 @@ month (`train`), then every 2–4 weeks — there is still no cron for retrainin
 | 12:00–22:00 every 2h | `snapshot` (cron) |
 | 17:05–23:05 hourly | `scan` (dry-run cron; `scan-live` when trusted). Only games tipping within `SCAN_WITHIN_HOURS`=1.5 |
 | before tip, optional | `data/absent_YYYY-MM-DD.json` `{"OUT": ["Name", ...]}` to add late scratches the injury feed missed |
-| 04:30 (launchd) | `nightly`: `etl --incremental`, `reconcile` (3-day lookback), `report`; Sundays also `refit-blend` |
+| 04:30 (launchd) | `nightly`: `etl --incremental`, `reconcile` (3-day lookback), `report`; Sundays also `train` + `refit-blend` |
 
 Scan skips — never prices off the market — any market whose player can't be resolved to
 tonight's game or has fewer than `GAMES_FOR_LAMBDA_SANITY` games.

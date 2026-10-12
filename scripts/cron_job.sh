@@ -100,6 +100,17 @@ case "$JOB" in
     # standalone 5am cron slot: that slot silently missed 2 straight Sundays
     # because the laptop was asleep at exactly 5am.
     if [[ "$(TZ=America/New_York date '+%u')" == "7" ]]; then
+      # Weekly retrain on the freshly ETL'd data (~1 min). mlb_tb_line never got a
+      # retrain cron (its fit takes ~11h) and ran 19 days on a stale model; here a
+      # failed fit leaves the previous model in place and calibrate_preflight
+      # blocks live scans once it falls MODEL_MAX_DATA_LAG_DAYS behind the data.
+      # AUTO_RETRAIN=0 in .env turns this off (e.g. once a fill calibrator exists:
+      # every retrain invalidates it, and REQUIRE_FILL_CALIB_FOR_LIVE then blocks live).
+      auto_retrain="$(grep -E '^AUTO_RETRAIN=' .env 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"' || true)"
+      if [[ "${auto_retrain:-1}" != "0" ]]; then
+        log "Sunday — retraining model"
+        run_py train || log "train failed — previous model stays in place"
+      fi
       log "Sunday — also running refit-blend"
       run_py refit-blend
     fi
