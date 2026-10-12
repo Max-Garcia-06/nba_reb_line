@@ -26,7 +26,9 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from sqlalchemy import create_engine, inspect, text
@@ -34,6 +36,7 @@ from sqlalchemy import create_engine, inspect, text
 from nba_api.stats.endpoints import (
     leaguedashptstats,
     playergamelogs,
+    playerindex,
     scheduleleaguev2,
 )
 
@@ -129,6 +132,39 @@ def fetch_schedule(season: str) -> pd.DataFrame:
     })
     # Preseason / All-Star / placeholder rows have no real team ids.
     return out[(out["HOME_TEAM_ID"] > 0) & (out["AWAY_TEAM_ID"] > 0)]
+
+
+# ---------------------------------------------------------------------------
+# 3b. Live rosters (scan only — never stored, never used for history)
+# ---------------------------------------------------------------------------
+
+def _today_et() -> str:
+    return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+
+
+@lru_cache(maxsize=4)
+def _fetch_current_rosters(season: str) -> dict[int, int]:
+    df = _call(playerindex.PlayerIndex, season=season)[0]
+    df = df[pd.to_numeric(df["TEAM_ID"], errors="coerce").fillna(0) > 0]
+    return dict(zip(df["PERSON_ID"].astype(int), df["TEAM_ID"].astype(int)))
+
+
+def current_team_by_player(game_date: str) -> dict[int, int]:
+    """
+    {PLAYER_ID: TEAM_ID} from today's league rosters, for a slate on/after today.
+
+    The gamelog's last-played team is wrong for every offseason move and every
+    trade until the player's first game for his new team. PlayerIndex is a
+    snapshot of *now*, so past dates get {} and stay point-in-time; so does any
+    API failure (callers fall back to the last-played team).
+    """
+    if game_date < _today_et():
+        return {}
+    try:
+        return _fetch_current_rosters(season_for_date(game_date))
+    except Exception as e:
+        log.warning(f"Live rosters unavailable ({e}); using last-played team")
+        return {}
 
 
 # ---------------------------------------------------------------------------

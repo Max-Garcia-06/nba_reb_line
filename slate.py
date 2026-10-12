@@ -58,13 +58,23 @@ def _event_ticker(ml) -> str:
 
 
 def recent_rosters(game_date: str, team_ids: set[int], gl: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Players whose most recent game before `game_date` was for one of `team_ids` (trades handled)."""
+    """
+    Players on `team_ids` for `game_date`, among those with history before it.
+
+    Live slates use today's league rosters (offseason moves, trades not yet
+    played); otherwise the team of each player's most recent game.
+    """
     gl = de.load_gamelogs() if gl is None else gl
     gl = gl[["PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "GAME_DATE"]].copy()
     gl["GAME_DATE"] = pd.to_datetime(gl["GAME_DATE"])
     gl = gl[gl["GAME_DATE"] < pd.Timestamp(game_date)]
     last = gl.sort_values("GAME_DATE").groupby("PLAYER_ID").tail(1)
-    last = last[last["GAME_DATE"] >= pd.Timestamp(game_date) - pd.Timedelta(days=200)]
+    current = de.current_team_by_player(game_date)
+    if current:
+        last = last[last["PLAYER_ID"].astype(int).isin(current)].copy()
+        last["TEAM_ID"] = last["PLAYER_ID"].astype(int).map(current)
+    else:
+        last = last[last["GAME_DATE"] >= pd.Timestamp(game_date) - pd.Timedelta(days=200)]
     return last[last["TEAM_ID"].astype(int).isin(team_ids)]
 
 

@@ -48,3 +48,51 @@ def test_playoff_flag_excludes_play_in():
     assert slate._is_playoffs("0042500101")
     assert not slate._is_playoffs("0052500101")
     assert not slate._is_playoffs("0022500101")
+
+
+def _gl():
+    return pd.DataFrame({
+        "PLAYER_ID": [1, 2, 3, 4],
+        "PLAYER_NAME": ["Stays Put", "Moved Teams", "Free Agent", "Long Injury"],
+        "TEAM_ID": [10, 20, 10, 10],
+        "GAME_DATE": ["2026-04-10", "2026-04-12", "2026-04-12", "2025-12-01"],
+    })
+
+
+def test_recent_rosters_live_roster_overrides_last_played_team(monkeypatch):
+    # Offseason: player 2 moved 20 -> 10, player 3 is unsigned, player 4 missed
+    # all of last spring but is on the opening-night roster.
+    monkeypatch.setattr(slate.de, "current_team_by_player", lambda d: {1: 10, 2: 10, 4: 10})
+    r = slate.recent_rosters("2026-10-20", {10}, gl=_gl())
+    assert sorted(r["PLAYER_ID"]) == [1, 2, 4]
+    assert set(r["TEAM_ID"]) == {10}
+
+
+def test_recent_rosters_falls_back_to_last_played_team(monkeypatch):
+    # No live roster (historical date or nba_api down): last team played for,
+    # within the 200-day window — the pre-existing point-in-time behaviour.
+    monkeypatch.setattr(slate.de, "current_team_by_player", lambda d: {})
+    r = slate.recent_rosters("2026-10-20", {10}, gl=_gl())
+    assert sorted(r["PLAYER_ID"]) == [1, 3]
+
+
+def test_current_team_by_player_only_for_live_dates(monkeypatch):
+    import data_engine as de
+
+    calls = []
+    monkeypatch.setattr(de, "_fetch_current_rosters", lambda season: calls.append(season) or {7: 99})
+    monkeypatch.setattr(de, "_today_et", lambda: "2026-10-20")
+    assert de.current_team_by_player("2026-03-10") == {}      # backtests stay point-in-time
+    assert de.current_team_by_player("2026-10-20") == {7: 99}
+    assert calls == ["2026-27"]
+
+
+def test_current_team_by_player_survives_api_failure(monkeypatch):
+    import data_engine as de
+
+    def boom(season):
+        raise RuntimeError("stats.nba.com down")
+
+    monkeypatch.setattr(de, "_fetch_current_rosters", boom)
+    monkeypatch.setattr(de, "_today_et", lambda: "2026-10-20")
+    assert de.current_team_by_player("2026-10-21") == {}
