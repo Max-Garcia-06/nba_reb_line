@@ -90,6 +90,20 @@ def evaluate(
     console.print(bakeoff.summary().round(4).to_string(index=False))
 
 
+def _sweep_resting_orders(client, game_date: str, series_ticker: str, keep: set[tuple[str, str]]) -> None:
+    """Cancel today's resting orders the scan did not re-confirm; exit 1 if that can't be checked."""
+    from edge_detector import cancel_unconfirmed_orders
+    from journal_risk import RiskDataUnavailable
+
+    try:
+        cancelled = cancel_unconfirmed_orders(client, game_date=game_date, series_ticker=series_ticker, keep=keep)
+    except RiskDataUnavailable as e:
+        console.print(f"[red]Could not sweep resting orders ({e}) — check Kalshi for orders this scan did not confirm.[/red]")
+        raise typer.Exit(1)
+    if cancelled:
+        console.print(f"[yellow]Cancelled {len(cancelled)} resting order(s) this scan did not re-confirm.[/yellow]")
+
+
 def scan(
     game_date: str = typer.Option(None, "--date", help="Game date YYYY-MM-DD. Defaults to today."),
     bankroll: float = typer.Option(1000.0, "--bankroll"),
@@ -110,6 +124,7 @@ def scan(
         EDGE_THRESHOLD,
         KALSHI_SERIES,
         MAKER_MODE,
+        MAX_BET_PCT,
         MAX_YES_LINE,
         MIN_LIMIT_PRICE,
         MIN_P,
@@ -123,7 +138,6 @@ def scan(
     from edge_detector import (
         MAX_BID_ASK_SPREAD,
         apply_flow_guard,
-        dollars_to_contracts,
         execute_signals,
         expected_pnl_usd,
         expected_pnl_usd_std,
@@ -135,7 +149,7 @@ def scan(
     )
     from market_blend import load_blend_weight
     from kalshi_bridge import MockKalshiClient, attach_vpin_proxy_batch, get_client
-    from capital_optimizer import resize_signals_portfolio
+    from trading_stack import finalize_signals
 
     _header("Phase 4 — Edge Scan")
     game_date = game_date or datetime.today().strftime("%Y-%m-%d")
@@ -150,277 +164,321 @@ def scan(
     console.print(f"Min P     : {min_p_eff:.3f}  (tail<{tail_p_eff:.3f} ⇒ edge×{tail_mult_eff:.2f})")
     console.print(f"Orders    : {'[yellow]DRY RUN[/yellow]' if dry_run else '[red]LIVE[/red]'}\n")
 
-    trained_model, meta = load_model()
-
-    from calibrate_preflight import check_calibrate_preflight
-
-    preflight = check_calibrate_preflight(live=not dry_run)
-    for w in preflight.warnings:
-        _warn(w)
-    if not preflight.ok:
-        for e in preflight.errors:
-            console.print(f"[red]Calibration preflight error: {e}[/red]")
-        raise typer.Exit(1)
-
     client = get_client()
     if isinstance(client, MockKalshiClient):
-        _warn(
-            "Kalshi MOCK client is active (missing or empty KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_PATH in "
-            f"{BASE_DIR}/.env). You only see 3 placeholder markets — not the real exchange."
-        )
-    else:
-        from risk_manager import resolve_bankroll
-        bankroll = resolve_bankroll(bankroll, client)
-    console.print(f"Bankroll  : ${bankroll:,.2f}")
-    market_lines = client.get_rebound_lines(game_date, series_ticker=series_ticker)
-    if not market_lines:
-        _warn(f"No rebound markets found for date {game_date} (series={series_ticker}).")
-        raise typer.Exit(0)
-
-    from data_engine import filter_market_lines_pregame
-
-    market_lines, excluded_games = filter_market_lines_pregame(market_lines, game_date)
-    if excluded_games:
-        for et, slug, status in excluded_games:
-            console.print(f"[dim]Skipping started game {slug} ({status}) — {et}[/dim]")
         console.print(
-            f"[dim]Excluded {len(excluded_games)} in-progress/final game(s); "
-            f"{len(market_lines)} market(s) remain.[/dim]\n"
+            "[red]Kalshi MOCK client is active (missing or empty KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY_PATH in "
+            f"{BASE_DIR}/.env). Refusing to scan placeholder markets.[/red]"
         )
-    if not market_lines:
-        _warn("No pre-game rebound markets left after excluding started games.")
-        raise typer.Exit(0)
+        raise typer.Exit(1)
+    if not dry_run:
+        from settings_validate import live_trading_errors
 
-    if SCAN_WITHIN_HOURS > 0:
-        from data_engine import filter_market_lines_by_start_window
+        live_errors = live_trading_errors()
+        for e in live_errors:
+            console.print(f"[red]{e}[/red]")
+        if live_errors:
+            raise typer.Exit(1)
 
-        market_lines, excluded_window = filter_market_lines_by_start_window(
-            market_lines, game_date, within_hours=SCAN_WITHIN_HOURS
-        )
-        if excluded_window:
-            console.print(
-                f"[dim]Entry window: excluded {len(excluded_window)} game(s) not starting within "
-                f"{SCAN_WITHIN_HOURS:g}h; {len(market_lines)} market(s) remain.[/dim]\n"
-            )
+    from journal_risk import RiskDataUnavailable
+    from risk_manager import kill_switch_active, resolve_bankroll
+
+    # (ticker, side) pairs this scan wants resting. In live mode every exit path ends
+    # with a sweep that cancels today's resting orders not in this set.
+    keep: set[tuple[str, str]] = set()
+    try:
+        if not dry_run:
+            if kill_switch_active():
+                console.print("[red]Kill switch file present — trading halted; cancelling resting orders.[/red]")
+                raise typer.Exit(1)
+            try:
+                bankroll = resolve_bankroll(bankroll, client, strict=True)
+            except RiskDataUnavailable as e:
+                console.print(f"[red]Live balance unavailable — not trading: {e}[/red]")
+                raise typer.Exit(1)
+        else:
+            bankroll = resolve_bankroll(bankroll, client)
+        trained_model, meta = load_model()
+
+        from calibrate_preflight import check_calibrate_preflight
+
+        preflight = check_calibrate_preflight(live=not dry_run)
+        for w in preflight.warnings:
+            _warn(w)
+        if not preflight.ok:
+            for e in preflight.errors:
+                console.print(f"[red]Calibration preflight error: {e}[/red]")
+            raise typer.Exit(1)
+
+        console.print(f"Bankroll  : ${bankroll:,.2f}")
+        market_lines = client.get_rebound_lines(game_date, series_ticker=series_ticker)
         if not market_lines:
-            _warn(f"No markets starting within {SCAN_WITHIN_HOURS:g}h (SCAN_WITHIN_HOURS).")
+            _warn(f"No rebound markets found for date {game_date} (series={series_ticker}).")
             raise typer.Exit(0)
 
-    console.print(f"Found {len(market_lines)} rebound markets on Kalshi (pre-game only)\n")
+        from data_engine import filter_market_lines_pregame
 
-    attach_vpin_proxy_batch(client, market_lines, max_workers=8)
+        market_lines, excluded_games = filter_market_lines_pregame(market_lines, game_date)
+        if excluded_games:
+            for et, slug, status in excluded_games:
+                console.print(f"[dim]Skipping started game {slug} ({status}) — {et}[/dim]")
+            console.print(
+                f"[dim]Excluded {len(excluded_games)} in-progress/final game(s); "
+                f"{len(market_lines)} market(s) remain.[/dim]\n"
+            )
+        if not market_lines:
+            _warn("No pre-game rebound markets left after excluding started games.")
+            raise typer.Exit(0)
 
-    # Point-in-time features for tonight's games (same code path as training).
-    # Unresolved players / thin history are skipped — never priced off the market.
-    predictions, market_lines, skipped = build_slate_predictions(market_lines, game_date, trained_model)
-    for msg in skipped:
-        console.print(f"[dim]Skip {msg}[/dim]")
-    if not predictions:
-        _warn("No markets could be matched to a player with enough history.")
-        raise typer.Exit(0)
+        if SCAN_WITHIN_HOURS > 0:
+            from data_engine import filter_market_lines_by_start_window
 
-    prob_results = calculate_probabilities(predictions, distribution=meta.get("family", "pmf"))
-    fill_calibrated_probabilities(prob_results)
+            market_lines, excluded_window = filter_market_lines_by_start_window(
+                market_lines, game_date, within_hours=SCAN_WITHIN_HOURS
+            )
+            if excluded_window:
+                console.print(
+                    f"[dim]Entry window: excluded {len(excluded_window)} game(s) not starting within "
+                    f"{SCAN_WITHIN_HOURS:g}h; {len(market_lines)} market(s) remain.[/dim]\n"
+                )
+            if not market_lines:
+                _warn(f"No markets starting within {SCAN_WITHIN_HOURS:g}h (SCAN_WITHIN_HOURS).")
+                raise typer.Exit(0)
 
-    def _edge_thr_for_p(p: float) -> float:
-        return float(edge_thr) * (float(tail_mult_eff) if float(p) < float(tail_p_eff) else 1.0)
+        console.print(f"Found {len(market_lines)} rebound markets on Kalshi (pre-game only)\n")
 
-    def _fmt_edge_cell(
-        e: float,
-        p_side: float,
-        ask: float,
-        spread: float,
-        *,
-        side: str,
-        kalshi_line: float,
-    ) -> str:
-        """Color fee-adjusted blended edge using the same pre-EV gates as detect_edge (not EV)."""
-        need = _edge_thr_for_p(p_side)
-        spread_ok = spread <= MAX_BID_ASK_SPREAD
-        ask_ok = ask >= MIN_LIMIT_PRICE
-        line_ok = float(kalshi_line) <= float(MAX_YES_LINE) if side == "yes" else True
-        seg_ok = not is_blocked_segment(kalshi_line, side)
-        min_ok = p_side >= min_p_eff
-        edge_ok = e > need and spread_ok and ask_ok and line_ok and seg_ok
-        color = "green" if edge_ok and min_ok else ("yellow" if e > 0 else "red")
-        return f"[{color}]{e:+.3f}[/{color}]"
+        attach_vpin_proxy_batch(client, market_lines, max_workers=8)
 
-    console.print(
-        f"[dim]Blend w={load_blend_weight():.2f} (p = w·model + (1−w)·market mid, logit space) · "
-        f"maker mode {'ON' if MAKER_MODE else 'OFF'} · edges net of Kalshi fee at limit.[/dim]"
-    )
-    console.print(
-        "[dim]Legend: Pr/Pc/Pb = P(over) raw / calibrated / blended-with-market; "
-        f"eY/eN = blended edge net of fee vs suggested limit (same as signals; max spread {MAX_BID_ASK_SPREAD:.2f}). "
-        "Green eY/eN = passes min_p + edge vs threshold + spread + ask + segment gates, not EV.[/dim]\n"
-    )
-    t = Table(title=f"Rebounds vs Kalshi — {game_date}", box=box.SIMPLE_HEAD)
-    t.add_column("Player", style="cyan", min_width=14, overflow="ellipsis")
-    t.add_column("Ln", justify="right", min_width=3)
-    t.add_column("E[R]", justify="right", min_width=4)
-    t.add_column("Pr", justify="right", min_width=5)
-    t.add_column("Pc", justify="right", min_width=5)
-    t.add_column("Pb", justify="right", min_width=5)
-    t.add_column("Y\nmid", justify="right", min_width=5)
-    t.add_column("Y\nask", justify="right", min_width=5)
-    t.add_column("eY", justify="right", min_width=6)
-    t.add_column("Ysp", justify="right", min_width=4)
-    t.add_column("N\nask", justify="right", min_width=5)
-    t.add_column("eN", justify="right", min_width=6)
-    t.add_column("Nsp", justify="right", min_width=4)
+        # Point-in-time features for tonight's games (same code path as training).
+        # Unresolved players / thin history are skipped — never priced off the market.
+        predictions, market_lines, skipped = build_slate_predictions(market_lines, game_date, trained_model)
+        for msg in skipped:
+            console.print(f"[dim]Skip {msg}[/dim]")
+        if not predictions:
+            _warn("No markets could be matched to a player with enough history.")
+            raise typer.Exit(0)
 
-    for pr, ml in zip(prob_results, market_lines):
-        p_or = float(pr.p_over)
-        p_oc = float(pr.p_over_calibrated) if pr.p_over_calibrated is not None else p_or
-        p_uc = float(pr.p_under_calibrated) if pr.p_under_calibrated is not None else (1.0 - p_or)
-        p_ob, _, _, yes_edge = quote_side_edge(p_oc, bid=float(ml.yes_bid), ask=float(ml.yes_ask), side="yes")
-        p_ub, _, _, no_edge = quote_side_edge(p_uc, bid=float(ml.no_bid), ask=float(ml.no_ask), side="no")
-        eY_cell = _fmt_edge_cell(
-            yes_edge, p_ob, float(ml.yes_ask), float(ml.yes_spread), side="yes", kalshi_line=float(ml.line)
+        prob_results = calculate_probabilities(predictions, distribution=meta.get("family", "pmf"))
+        fill_calibrated_probabilities(prob_results)
+
+        def _edge_thr_for_p(p: float) -> float:
+            return float(edge_thr) * (float(tail_mult_eff) if float(p) < float(tail_p_eff) else 1.0)
+
+        def _fmt_edge_cell(
+            e: float,
+            p_side: float,
+            bid: float,
+            ask: float,
+            spread: float,
+            *,
+            side: str,
+            kalshi_line: float,
+        ) -> str:
+            """Color fee-adjusted blended edge using the same pre-EV gates as detect_edge (not EV)."""
+            need = _edge_thr_for_p(p_side)
+            spread_ok = bid > 0 and spread <= MAX_BID_ASK_SPREAD
+            ask_ok = ask >= MIN_LIMIT_PRICE
+            line_ok = float(kalshi_line) <= float(MAX_YES_LINE) if side == "yes" else True
+            seg_ok = not is_blocked_segment(kalshi_line, side)
+            min_ok = p_side >= min_p_eff
+            edge_ok = e > need and spread_ok and ask_ok and line_ok and seg_ok
+            color = "green" if edge_ok and min_ok else ("yellow" if e > 0 else "red")
+            return f"[{color}]{e:+.3f}[/{color}]"
+
+        console.print(
+            f"[dim]Blend w={load_blend_weight():.2f} (p = w·model + (1−w)·market mid, logit space) · "
+            f"maker mode {'ON' if MAKER_MODE else 'OFF'} · edges net of Kalshi fee at limit.[/dim]"
         )
-        eN_cell = _fmt_edge_cell(
-            no_edge, p_ub, float(ml.no_ask), float(ml.no_spread), side="no", kalshi_line=float(ml.line)
+        console.print(
+            "[dim]Legend: Pr/Pc/Pb = P(over) raw / calibrated / blended-with-market; "
+            f"eY/eN = blended edge net of fee vs suggested limit (same as signals; max spread {MAX_BID_ASK_SPREAD:.2f}). "
+            "Green eY/eN = passes min_p + edge vs threshold + spread + ask + segment gates, not EV.[/dim]\n"
         )
-        t.add_row(
-            pr.player_name,
-            f"{ml.line:g}",
-            f"{pr.predicted_lambda:.2f}",
-            f"{p_or:.3f}",
-            f"{p_oc:.3f}",
-            f"{p_ob:.3f}",
-            f"{ml.implied_prob:.3f}",
-            f"{ml.yes_ask:.2f}",
-            eY_cell,
-            f"{ml.yes_spread:.2f}",
-            f"{ml.no_ask:.2f}",
-            eN_cell,
-            f"{ml.no_spread:.2f}",
+        t = Table(title=f"Rebounds vs Kalshi — {game_date}", box=box.SIMPLE_HEAD)
+        t.add_column("Player", style="cyan", min_width=14, overflow="ellipsis")
+        t.add_column("Ln", justify="right", min_width=3)
+        t.add_column("E[R]", justify="right", min_width=4)
+        t.add_column("Pr", justify="right", min_width=5)
+        t.add_column("Pc", justify="right", min_width=5)
+        t.add_column("Pb", justify="right", min_width=5)
+        t.add_column("Y\nmid", justify="right", min_width=5)
+        t.add_column("Y\nask", justify="right", min_width=5)
+        t.add_column("eY", justify="right", min_width=6)
+        t.add_column("Ysp", justify="right", min_width=4)
+        t.add_column("N\nask", justify="right", min_width=5)
+        t.add_column("eN", justify="right", min_width=6)
+        t.add_column("Nsp", justify="right", min_width=4)
+
+        for pr, ml in zip(prob_results, market_lines):
+            p_or = float(pr.p_over)
+            p_oc = float(pr.p_over_calibrated) if pr.p_over_calibrated is not None else p_or
+            p_uc = float(pr.p_under_calibrated) if pr.p_under_calibrated is not None else (1.0 - p_or)
+            p_ob, _, _, yes_edge = quote_side_edge(p_oc, bid=float(ml.yes_bid), ask=float(ml.yes_ask), side="yes")
+            p_ub, _, _, no_edge = quote_side_edge(p_uc, bid=float(ml.no_bid), ask=float(ml.no_ask), side="no")
+            eY_cell = _fmt_edge_cell(
+                yes_edge, p_ob, float(ml.yes_bid), float(ml.yes_ask), float(ml.yes_spread), side="yes", kalshi_line=float(ml.line)
+            )
+            eN_cell = _fmt_edge_cell(
+                no_edge, p_ub, float(ml.no_bid), float(ml.no_ask), float(ml.no_spread), side="no", kalshi_line=float(ml.line)
+            )
+            t.add_row(
+                pr.player_name,
+                f"{ml.line:g}",
+                f"{pr.predicted_lambda:.2f}",
+                f"{p_or:.3f}",
+                f"{p_oc:.3f}",
+                f"{p_ob:.3f}",
+                f"{ml.implied_prob:.3f}",
+                f"{ml.yes_ask:.2f}",
+                eY_cell,
+                f"{ml.yes_spread:.2f}",
+                f"{ml.no_ask:.2f}",
+                eN_cell,
+                f"{ml.no_spread:.2f}",
+            )
+        console.print(t)
+
+        signals = scan_for_edges(
+            prob_results,
+            market_lines,
+            bankroll,
+            edge_threshold=edge_thr,
+            min_p=min_p_eff,
+            tail_p_cutoff=tail_p_eff,
+            tail_edge_mult=tail_mult_eff,
         )
-    console.print(t)
+        signals = apply_flow_guard(signals, market_lines)
 
-    signals = scan_for_edges(
-        prob_results,
-        market_lines,
-        bankroll,
-        edge_threshold=edge_thr,
-        min_p=min_p_eff,
-        tail_p_cutoff=tail_p_eff,
-        tail_edge_mult=tail_mult_eff,
-    )
-    signals = apply_flow_guard(signals, market_lines)
+        if not signals:
+            _warn("No edges found.")
+            raise typer.Exit(0)
 
-    if not signals:
-        _warn("No edges found.")
-        raise typer.Exit(0)
+        existing_player_usd: dict[str, float] = {}
+        if not dry_run:
+            from execution_engine import ExecutionLedger, LedgerKey
+            from journal_risk import player_exposure_usd
 
-    if one_per_player:
-        seen = {}
+            # Orders already submitted today stay up (keep) and don't re-enter sizing;
+            # their dollars count against the player's cap instead.
+            ledger = ExecutionLedger()
+            working = {
+                id(s) for s in signals if ledger.has_successful_submit(LedgerKey(s.game_date, s.ticker, s.recommended_side))
+            }
+            keep |= {(s.ticker, s.recommended_side) for s in signals if id(s) in working}
+            signals = [s for s in signals if id(s) not in working]
+            existing_player_usd = player_exposure_usd(game_date)
+
+        signals = finalize_signals(
+            signals,
+            bankroll=bankroll,
+            one_per_player=one_per_player,
+            max_signals=max_signals,
+            max_contracts=max_contracts,
+            existing_player_usd=existing_player_usd,
+            max_player_usd=MAX_BET_PCT * bankroll,
+        )
+        if not signals:
+            _warn("No edges remained after sizing / contract filters.")
+            raise typer.Exit(0)
+
+        total_deployed = sum(s.bet_dollars for s in signals)
+        console.print(f"\n[bold green]{len(signals)} edge(s) detected — ${total_deployed:.2f} total deployed:[/bold green]\n")
+
+        sig_table = Table(box=box.SIMPLE_HEAD)
+        sig_table.add_column("Player", style="cyan", min_width=24)
+        sig_table.add_column("Line", justify="right")
+        sig_table.add_column("Side", justify="center")
+        sig_table.add_column("Edge", justify="right")
+        sig_table.add_column("EV", justify="right")
+        sig_table.add_column("Contracts", justify="right")
+        sig_table.add_column("Limit", justify="right")
+        sig_table.add_column("$Bet", justify="right")
+        sig_table.add_column("E[PnL] ±1σ", justify="right")
         for s in signals:
-            if s.player_name not in seen or s.ev > seen[s.player_name].ev:
-                seen[s.player_name] = s
-        signals = sorted(seen.values(), key=lambda s: s.ev, reverse=True)
-
-    if max_signals and len(signals) > max_signals:
-        signals = signals[:max_signals]
-
-    resize_signals_portfolio(signals, bankroll)
-
-    for s in signals:
-        if max_contracts:
-            s.recommended_contracts = min(s.recommended_contracts, max_contracts)
-        s.bet_dollars = round(s.recommended_contracts * s.limit_price, 2)
-
-    total_raw = sum(s.bet_dollars for s in signals)
-    if total_raw > bankroll:
-        scale = bankroll / total_raw
-        for s in signals:
-            s.bet_dollars = round(s.bet_dollars * scale, 2)
-            s.recommended_contracts = dollars_to_contracts(s.bet_dollars, s.limit_price)
-            if max_contracts:
-                s.recommended_contracts = min(s.recommended_contracts, max_contracts)
-            s.bet_dollars = round(s.recommended_contracts * s.limit_price, 2)
-
-    signals = [s for s in signals if s.recommended_contracts > 0]
-    if not signals:
-        _warn("No edges remained after sizing / contract filters.")
-        raise typer.Exit(0)
-
-    total_deployed = sum(s.bet_dollars for s in signals)
-    console.print(f"\n[bold green]{len(signals)} edge(s) detected — ${total_deployed:.2f} total deployed:[/bold green]\n")
-
-    sig_table = Table(box=box.SIMPLE_HEAD)
-    sig_table.add_column("Player", style="cyan", min_width=24)
-    sig_table.add_column("Line", justify="right")
-    sig_table.add_column("Side", justify="center")
-    sig_table.add_column("Edge", justify="right")
-    sig_table.add_column("EV", justify="right")
-    sig_table.add_column("Contracts", justify="right")
-    sig_table.add_column("Limit", justify="right")
-    sig_table.add_column("$Bet", justify="right")
-    sig_table.add_column("E[PnL] ±1σ", justify="right")
-    for s in signals:
-        xp = expected_pnl_usd(s)
-        sig = expected_pnl_usd_std(s)
-        xp_cell = f"[green]{xp:+.2f} ±{sig:.2f}[/green]" if xp >= 0 else f"[red]{xp:+.2f} ±{sig:.2f}[/red]"
-        sig_table.add_row(
-            s.player_name,
-            str(s.kalshi_line),
-            f"[green]{s.recommended_side.upper()}[/green]",
-            f"[green]{s.edge:+.3f}[/green]",
-            f"{s.ev:.3f}",
-            str(s.recommended_contracts),
-            f"{s.limit_price:.2f}",
-            f"${s.bet_dollars:.2f}",
-            xp_cell,
+            xp = expected_pnl_usd(s)
+            sig = expected_pnl_usd_std(s)
+            xp_cell = f"[green]{xp:+.2f} ±{sig:.2f}[/green]" if xp >= 0 else f"[red]{xp:+.2f} ±{sig:.2f}[/red]"
+            sig_table.add_row(
+                s.player_name,
+                str(s.kalshi_line),
+                f"[green]{s.recommended_side.upper()}[/green]",
+                f"[green]{s.edge:+.3f}[/green]",
+                f"{s.ev:.3f}",
+                str(s.recommended_contracts),
+                f"{s.limit_price:.2f}",
+                f"${s.bet_dollars:.2f}",
+                xp_cell,
+            )
+        console.print(sig_table)
+        total_xp = sum(expected_pnl_usd(s) for s in signals)
+        port_sig = portfolio_expected_pnl_std(signals)
+        console.print(
+            "[dim]E[PnL] = N×E[per contract]; σ = √(N·Var per contract) with Var from Bernoulli payoffs at limit. "
+            "Portfolio σ = √(Σ leg variances), treating legs as independent (same-slate correlation usually increases true risk). "
+            f"Sum E[PnL] = ${total_xp:+.2f}; idiosyncratic σ ≈ ${port_sig:.2f} (~68% band ±1σ if normal).[/dim]"
         )
-    console.print(sig_table)
-    total_xp = sum(expected_pnl_usd(s) for s in signals)
-    port_sig = portfolio_expected_pnl_std(signals)
-    console.print(
-        "[dim]E[PnL] = N×E[per contract]; σ = √(N·Var per contract) with Var from Bernoulli payoffs at limit. "
-        "Portfolio σ = √(Σ leg variances), treating legs as independent (same-slate correlation usually increases true risk). "
-        f"Sum E[PnL] = ${total_xp:+.2f}; idiosyncratic σ ≈ ${port_sig:.2f} (~68% band ±1σ if normal).[/dim]"
-    )
 
-    if not dry_run:
-        console.print("\n[bold red]LIVE MODE — placing orders...[/bold red]")
-        todays_tickers = {ml.ticker for ml in market_lines}
-        results = execute_signals(signals, dry_run=False, todays_tickers=todays_tickers, cancel_stale=True)
-        if auto_mark and results:
-            import subprocess
-            import sys
-            from pathlib import Path
+        if not dry_run:
+            console.print("\n[bold red]LIVE MODE — placing orders...[/bold red]")
+            from data_engine import tip_epoch_by_ticker
+            from risk_manager import check_pre_trade_risk
 
-            import run_pipeline as _rp
+            risk = check_pre_trade_risk(
+                game_date=game_date,
+                cli_bankroll=bankroll,
+                client=client,
+                n_new_orders=len(signals),
+                proposed_signals=signals,
+                strict=True,
+            )
+            if not risk.ok:
+                keep.clear()
+                console.print(f"[red]Risk desk blocked trading: {risk.reason}[/red]")
+                if risk.auto_killed:
+                    console.print("[red]Kill switch activated.[/red]")
+                raise typer.Exit(1)
+            keep |= {(s.ticker, s.recommended_side) for s in signals}
+            results = execute_signals(
+                signals, client=client, expiration_by_ticker=tip_epoch_by_ticker(market_lines, game_date)
+            )
+            if auto_mark and results:
+                import subprocess
+                import sys
+                from pathlib import Path
 
-            delays = []
-            for part in str(mark_delays).split(","):
-                part = part.strip()
-                if not part:
-                    continue
-                try:
-                    delays.append(int(part))
-                except Exception:
-                    continue
-            delays = sorted(set([d for d in delays if d > 0]))
-            if delays:
-                _script = str(Path(_rp.__file__).resolve())
-                for d in delays:
-                    label = f"{d}m"
-                    argv = [sys.executable, _script, "mark", "--date", game_date, "--label", label]
-                    cmd = [
-                        sys.executable,
-                        "-c",
-                        "import time,subprocess,sys; "
-                        f"time.sleep({int(d)}*60); "
-                        f"subprocess.run({repr(argv)}, check=False)",
-                    ]
-                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                console.print(f"\n[dim]Auto-mark scheduled at: {', '.join(f'{d}m' for d in delays)}[/dim]")
-        _email_scan_summary(game_date, signals, total_xp, results=results)
-    else:
-        _warn("Dry run — no orders placed. Use --live to execute.")
-        _email_scan_summary(game_date, signals, total_xp, results=None)
+                import run_pipeline as _rp
+
+                delays = []
+                for part in str(mark_delays).split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    try:
+                        delays.append(int(part))
+                    except Exception:
+                        continue
+                delays = sorted(set([d for d in delays if d > 0]))
+                if delays:
+                    _script = str(Path(_rp.__file__).resolve())
+                    for d in delays:
+                        label = f"{d}m"
+                        argv = [sys.executable, _script, "mark", "--date", game_date, "--label", label]
+                        cmd = [
+                            sys.executable,
+                            "-c",
+                            "import time,subprocess,sys; "
+                            f"time.sleep({int(d)}*60); "
+                            f"subprocess.run({repr(argv)}, check=False)",
+                        ]
+                        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    console.print(f"\n[dim]Auto-mark scheduled at: {', '.join(f'{d}m' for d in delays)}[/dim]")
+            _email_scan_summary(game_date, signals, total_xp, results=results)
+        else:
+            _warn("Dry run — no orders placed. Use --live to execute.")
+            _email_scan_summary(game_date, signals, total_xp, results=None)
+    finally:
+        if not dry_run:
+            _sweep_resting_orders(client, game_date, series_ticker, keep)
 
 
 def mark(
@@ -2091,12 +2149,15 @@ def schedule_snapshots(
     import time
     from datetime import date as _date
     from config import KALSHI_SERIES
-    from kalshi_bridge import get_client
+    from kalshi_bridge import MockKalshiClient, get_client
     from market_snapshots import append_snapshots
 
     gd = game_date or _date.today().strftime("%Y-%m-%d")
     _header(f"Scheduled snapshots — {gd} × {count} every {interval}m")
     client = get_client()
+    if isinstance(client, MockKalshiClient):
+        _warn("Kalshi mock client active (no credentials in .env) — not writing snapshots.")
+        raise typer.Exit(1)
     for i in range(count):
         lines = client.get_rebound_lines(gd, series_ticker=series_ticker or KALSHI_SERIES)
         n = append_snapshots(gd, lines)

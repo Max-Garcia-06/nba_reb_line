@@ -15,6 +15,7 @@ from config import (
     DAILY_LOSS_LIMIT_PCT,
     DAILY_LOSS_LIMIT_USD,
     KILL_SWITCH_PATH,
+    LOSS_LIMIT_LOOKBACK_DAYS,
     MAX_CONTRACTS_PER_GAME,
     MAX_DAILY_DEPLOYED_PCT,
     MAX_DAILY_DEPLOYED_USD,
@@ -27,6 +28,7 @@ from config import (
 )
 from journal_risk import (
     DailyRiskSnapshot,
+    RiskDataUnavailable,
     count_new_player_legs,
     daily_risk_snapshot,
     merge_proposed_into_snapshot,
@@ -69,18 +71,29 @@ def resolve_bankroll(
     client: object | None,
     *,
     use_live_balance: bool | None = None,
+    strict: bool = False,
 ) -> float:
-    """Prefer exchange balance when configured and client supports it."""
+    """
+    Prefer exchange balance when configured and client supports it.
+
+    ``strict`` (live trading): an unreadable or non-positive balance raises
+    :class:`RiskDataUnavailable` instead of sizing against the CLI default.
+    """
     use_live = USE_LIVE_BALANCE if use_live_balance is None else use_live_balance
     if use_live and client is not None and hasattr(client, "get_balance"):
         try:
             bal = float(client.get_balance())
-            if bal > 0:
-                log.info("Using Kalshi available balance: $%.2f", bal)
-                return bal
-            log.warning("Kalshi balance returned %.2f; using CLI bankroll $%.2f", bal, cli_bankroll)
         except Exception as e:
+            if strict:
+                raise RiskDataUnavailable(f"get_balance failed: {e}") from e
             log.warning("get_balance failed, using CLI bankroll $%.2f: %s", cli_bankroll, e)
+            return float(cli_bankroll)
+        if bal > 0:
+            log.info("Using Kalshi available balance: $%.2f", bal)
+            return bal
+        if strict:
+            raise RiskDataUnavailable(f"Kalshi balance returned {bal:.2f}")
+        log.warning("Kalshi balance returned %.2f; using CLI bankroll $%.2f", bal, cli_bankroll)
     return float(cli_bankroll)
 
 
@@ -178,19 +191,31 @@ def check_pre_trade_risk(
     n_new_orders: int = 0,
     proposed_signals: list["EdgeSignal"] | None = None,
     snapshot: DailyRiskSnapshot | None = None,
+    strict: bool = False,
 ) -> RiskCheckResult:
+    """
+    Gate a batch of orders. ``strict`` (live trading) fails closed: any exchange
+    state that cannot be read blocks trading instead of being treated as zero.
+    """
     if kill_switch_active():
-        bal = resolve_bankroll(cli_bankroll, client)
-        eff = effective_bankroll_from(bal, 0.0)
         return RiskCheckResult(
             False,
-            bal,
-            eff,
+            float(cli_bankroll),
+            float(cli_bankroll),
             "Kill switch file present — trading halted",
         )
 
-    snap = snapshot if snapshot is not None else daily_risk_snapshot(game_date, client=client)
-    bankroll = resolve_bankroll(cli_bankroll, client)
+    try:
+        snap = (
+            snapshot
+            if snapshot is not None
+            else daily_risk_snapshot(
+                game_date, client=client, strict=strict, pnl_lookback_days=LOSS_LIMIT_LOOKBACK_DAYS
+            )
+        )
+        bankroll = resolve_bankroll(cli_bankroll, client, strict=strict)
+    except RiskDataUnavailable as e:
+        return RiskCheckResult(False, 0.0, 0.0, f"Risk data unavailable — trading blocked: {e}")
     eff = effective_bankroll_from(bankroll, snap.open_resting_usd)
 
     reason = _check_limits(

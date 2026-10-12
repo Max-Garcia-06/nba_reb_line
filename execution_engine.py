@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,10 @@ def _round_to_tick(x: float) -> float:
     return min(0.99, max(0.01, x))
 
 
+class LedgerCorruptError(RuntimeError):
+    """The ledger file exists but cannot be parsed; refusing to treat it as empty."""
+
+
 @dataclass(frozen=True)
 class LedgerKey:
     game_date: str
@@ -35,31 +40,46 @@ class ExecutionLedger:
         self._load()
 
     def _load(self) -> None:
+        # A corrupt ledger must not read as "nothing submitted" — every key would
+        # look new and be re-placed, and the next save would erase the history.
+        if not self.path.exists():
+            return
         try:
-            if self.path.exists():
-                self._data = json.loads(self.path.read_text())
-        except Exception:
-            self._data = {"version": 1, "entries": []}
+            self._data = json.loads(self.path.read_text())
+        except Exception as e:
+            raise LedgerCorruptError(f"Execution ledger {self.path} is unreadable ({e}); fix or move it aside") from e
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+        os.replace(tmp, self.path)
 
     def has(self, key: LedgerKey) -> bool:
         k = {"game_date": key.game_date, "ticker": key.ticker, "side": key.side}
         return k in (e.get("key") for e in self._data.get("entries", []))
 
     def has_successful_submit(self, key: LedgerKey) -> bool:
-        """True if we already logged a successful post-submit for this key (avoid duplicate live orders)."""
+        """
+        True if a post-submit for this key succeeded or ended ambiguously (network
+        error after send) — either way the order may be live, so never re-send it.
+        """
         k = {"game_date": key.game_date, "ticker": key.ticker, "side": key.side}
         for e in reversed(self._data.get("entries", [])):
             if e.get("key") != k:
                 continue
             if str(e.get("note", "")) != "post-submit":
                 continue
-            if e.get("success") is True:
+            if e.get("success") is True or e.get("ambiguous") is True:
                 return True
         return False
+
+    def count_submits(self, key: LedgerKey) -> int:
+        """Number of post-submit entries already logged for ``key`` (client_order_id attempt index)."""
+        k = {"game_date": key.game_date, "ticker": key.ticker, "side": key.side}
+        return sum(
+            1 for e in self._data.get("entries", []) if e.get("key") == k and str(e.get("note", "")) == "post-submit"
+        )
 
     def add_attempt(
         self,
@@ -71,19 +91,21 @@ class ExecutionLedger:
         note: str = "",
         order_id: str = "",
         success: Optional[bool] = None,
+        ambiguous: bool = False,
     ) -> None:
-        self._data.setdefault("entries", []).append(
-            {
-                "ts": _utc_now_iso(),
-                "key": {"game_date": key.game_date, "ticker": key.ticker, "side": key.side},
-                "price": price,
-                "contracts": contracts,
-                "dollars": dollars,
-                "order_id": order_id,
-                "success": success,
-                "note": note,
-            }
-        )
+        entry = {
+            "ts": _utc_now_iso(),
+            "key": {"game_date": key.game_date, "ticker": key.ticker, "side": key.side},
+            "price": price,
+            "contracts": contracts,
+            "dollars": dollars,
+            "order_id": order_id,
+            "success": success,
+            "note": note,
+        }
+        if ambiguous:
+            entry["ambiguous"] = True
+        self._data.setdefault("entries", []).append(entry)
         self._save()
 
 

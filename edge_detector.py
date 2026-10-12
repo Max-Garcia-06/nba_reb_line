@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import logging
 import math
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 from config import (
@@ -18,6 +20,7 @@ from config import (
     KELLY_FRACTION,
     MAKER_MODE,
     MAX_BET_PCT,
+    MAX_BID_ASK_SPREAD,
     MAX_REALISTIC_ASK,
     MIN_EV,
     MIN_P,
@@ -38,7 +41,7 @@ from config import (
 from fees import fee_per_contract
 from market_blend import blend_probability, load_blend_weight
 from probability_engine import ProbabilityResult
-from kalshi_bridge import MarketLine, OrderResult, get_client
+from kalshi_bridge import MarketLine, MockKalshiClient, OrderResult
 from execution_engine import ExecutionLedger, LedgerKey, suggest_limit_price
 from trade_journal import TradeRow, append_row
 from calibration import (
@@ -53,7 +56,6 @@ from identity_bridge import norm_player_name
 
 log = logging.getLogger(__name__)
 
-MAX_BID_ASK_SPREAD = 0.25
 _CALIBRATOR = None
 _OOF_CALIBRATOR = None
 _SEGMENTED: SegmentedCalibratorBundle | None | bool = None
@@ -353,6 +355,7 @@ def detect_edge(
     if (
         p_over_b >= min_p
         and yes_edge > _thr(p_over_b)
+        and market_line.yes_bid > 0
         and market_line.yes_spread <= max_spread
         and market_line.yes_ask >= MIN_LIMIT_PRICE
         and market_line.line <= MAX_YES_LINE
@@ -362,6 +365,7 @@ def detect_edge(
     if (
         p_under_b >= min_p
         and no_edge > _thr(p_under_b)
+        and market_line.no_bid > 0
         and market_line.no_spread <= max_spread
         and market_line.no_ask >= MIN_LIMIT_PRICE
         and not is_blocked_segment(market_line.line, "no")
@@ -468,43 +472,102 @@ def apply_flow_guard(signals: list[EdgeSignal], market_lines: list[MarketLine]) 
     return out
 
 
+def _ticker_date_prefix(series_ticker: str, game_date: str) -> str:
+    """``KXNBAREB-26OCT12`` for series ``KXNBAREB`` on 2026-10-12 (Kalshi event-date code)."""
+    return f"{series_ticker}-{datetime.strptime(game_date, '%Y-%m-%d').strftime('%y%b%d').upper()}"
+
+
+def cancel_unconfirmed_orders(
+    client: object,
+    *,
+    game_date: str,
+    series_ticker: str,
+    keep: set[tuple[str, str]],
+) -> list[str]:
+    """
+    Cancel every resting ``series_ticker`` order for ``game_date`` whose
+    ``(ticker, side)`` this scan did not re-confirm. Run after every live scan,
+    including ones that find no edges: an order is only left up while the latest
+    scan still wants it. Raises :class:`RiskDataUnavailable` when resting orders
+    cannot be listed.
+    """
+    from journal_risk import RiskDataUnavailable
+
+    try:
+        orders = client.get_orders(status="resting", limit=1000)
+    except Exception as e:
+        raise RiskDataUnavailable(f"get_orders(resting) failed: {e}") from e
+    prefix = _ticker_date_prefix(series_ticker, game_date)
+    cancelled: list[str] = []
+    for o in orders:
+        if not str(o.ticker).startswith(prefix) or (o.ticker, o.side) in keep:
+            continue
+        if client.cancel_order(o.order_id):
+            cancelled.append(o.order_id)
+        else:
+            log.error("Could not cancel stale order %s (%s %s)", o.order_id, o.ticker, o.side)
+    return cancelled
+
+
+def _client_order_id(key: LedgerKey, attempt: int) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{key.game_date}|{key.ticker}|{key.side}|{attempt}"))
+
+
 def execute_signals(
     signals: list[EdgeSignal],
-    dry_run: bool = True,
-    todays_tickers: Optional[set[str]] = None,
-    cancel_stale: bool = True,
+    *,
+    client: object,
+    expiration_by_ticker: dict[str, int],
     replace_if_price_diff: float = 0.02,
 ) -> list[OrderResult]:
-    client = get_client(force_mock=dry_run)
+    """
+    Place live orders for ``signals``.
+
+    Each order carries a deterministic ``client_order_id``, ``post_only`` when it
+    rests inside the ask, and ``expiration_time`` (unix seconds, just before tip)
+    from ``expiration_by_ticker``; a ticker with no known tip time is skipped.
+    The kill switch is re-checked before every order. A same-side resting order
+    at (about) the same price is left alone rather than duplicated.
+    """
+    from risk_manager import kill_switch_active
+
+    if isinstance(client, MockKalshiClient):
+        raise RuntimeError("Refusing to place live orders through the mock Kalshi client (credentials missing).")
     ledger = ExecutionLedger()
     results: list[OrderResult] = []
 
-    desired = {(s.ticker, s.recommended_side): s for s in signals}
-
-    if not dry_run and cancel_stale and hasattr(client, "get_orders") and hasattr(client, "cancel_order"):
-        try:
-            open_orders = client.get_orders(status="resting", limit=200)
-        except Exception as e:
-            log.warning(f"Could not fetch open orders ({e}); skipping cancel/replace.")
-            open_orders = []
-        todays_tickers = todays_tickers or set()
-        for o in open_orders:
-            if todays_tickers and o.ticker not in todays_tickers:
-                continue
-            if (o.ticker, o.side) not in desired:
-                client.cancel_order(o.order_id)
-
     for sig in signals:
+        if kill_switch_active():
+            log.error("Kill switch present — stopping order placement.")
+            break
         key = LedgerKey(game_date=sig.game_date, ticker=sig.ticker, side=sig.recommended_side)
-        if dry_run and ledger.has(key):
+        if ledger.has_successful_submit(key):
             continue
-        if not dry_run and ledger.has_successful_submit(key):
+        expiration = expiration_by_ticker.get(sig.ticker)
+        if not expiration:
+            log.warning("No tip time for %s — not placing an order that could rest into the game.", sig.ticker)
+            continue
+
+        try:
+            existing = [
+                o for o in client.get_orders(status="resting", ticker=sig.ticker, limit=50)
+                if o.side == sig.recommended_side
+            ]
+        except Exception as e:
+            log.warning("Could not read resting orders for %s (%s) — skipping.", sig.ticker, e)
+            continue
+        stale = [o for o in existing if abs(o.price - sig.limit_price) >= replace_if_price_diff]
+        if len(stale) < len(existing):
+            continue  # an order at about this price is already working
+        if not all(client.cancel_order(o.order_id) for o in stale):
+            log.warning("Could not cancel stale order(s) on %s — skipping replace.", sig.ticker)
             continue
 
         book_bid, book_ask, book_spread = float(sig.book_bid), float(sig.book_ask), float(sig.book_spread)
         p_market = float(sig.p_market)
 
         expected_pnl = float(sig.edge) * int(sig.recommended_contracts)
+        attempt = ledger.count_submits(key)
 
         ledger.add_attempt(key, price=sig.limit_price, contracts=sig.recommended_contracts, dollars=sig.bet_dollars, note="pre-submit")
         append_row(
@@ -537,17 +600,21 @@ def execute_signals(
             ).to_dict(),
         )
 
-        if not dry_run and hasattr(client, "get_orders") and hasattr(client, "cancel_order"):
-            try:
-                existing = [o for o in client.get_orders(status="resting", ticker=sig.ticker, limit=50) if o.side == sig.recommended_side]
-            except Exception:
-                existing = []
-            for o in existing:
-                if abs(o.price - sig.limit_price) >= replace_if_price_diff:
-                    client.cancel_order(o.order_id)
-
-        result = client.place_order(sig.ticker, sig.recommended_side, sig.recommended_contracts, sig.limit_price)
-        if not result.success:
+        result = client.place_order(
+            sig.ticker,
+            sig.recommended_side,
+            sig.recommended_contracts,
+            sig.limit_price,
+            client_order_id=_client_order_id(key, attempt),
+            post_only=sig.limit_price < book_ask - 1e-9,
+            expiration_time=int(expiration),
+        )
+        if result.ambiguous:
+            log.error(
+                "Order state UNKNOWN %s %s %s@%.2f (%s) — will not re-send today; check Kalshi.",
+                sig.ticker, sig.recommended_side, sig.recommended_contracts, sig.limit_price, result.message,
+            )
+        elif not result.success:
             log.warning("Order FAILED %s %s %s@%.2f: %s", sig.ticker, sig.recommended_side, sig.recommended_contracts, sig.limit_price, result.message)
         ledger.add_attempt(
             key,
@@ -557,6 +624,7 @@ def execute_signals(
             note="post-submit",
             order_id=result.order_id,
             success=result.success,
+            ambiguous=result.ambiguous,
         )
         append_row(
             sig.game_date,
@@ -584,10 +652,9 @@ def execute_signals(
                 book_ask=book_ask,
                 book_spread=book_spread,
                 note="post-submit",
-                success=result.success,
+                success=None if result.ambiguous else result.success,
             ).to_dict(),
         )
         results.append(result)
 
     return results
-

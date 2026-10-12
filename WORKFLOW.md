@@ -41,9 +41,26 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env      # Kalshi key id + PEM path; demo host until you mean it
 ```
 
-Set `REQUIRE_KALSHI_CREDENTIALS=1` in production so a missing key fails instead of
-silently using the mock client. `touch data/KILL_SWITCH` halts live orders; risk-limit
-breaches create it automatically (`AUTO_KILL_ON_RISK_BREACH=true`).
+`scan` and `snapshot`/`schedule-snapshots` exit 1 on the mock client (missing key),
+dry-run included. Every command validates `.env` at startup and refuses to run on
+out-of-range values.
+
+`scan --live` additionally:
+
+- refuses to start unless a daily loss cap (`DAILY_LOSS_LIMIT_*`) and a deployed cap
+  (`MAX_DAILY_DEPLOYED_*`) are set;
+- fails closed when the balance, resting orders, fills or markets can't be read;
+- runs the risk desk (`check_pre_trade_risk`) on the proposed orders, with intraday
+  P&L from Kalshi fills marked at the live mid, over `LOSS_LIMIT_LOOKBACK_DAYS`;
+- sizes each player against what earlier scans already committed today (`MAX_BET_PCT`);
+- sends every order with a deterministic `client_order_id`, `post_only` when resting
+  inside the ask, and `expiration_time` one minute before tip;
+- ends every run (edges or not, error or not) by cancelling today's resting orders
+  that this scan did not re-confirm.
+
+`touch data/KILL_SWITCH` halts live orders (checked before every order) and makes the
+next scan cancel all of today's resting orders; risk-limit breaches create it
+automatically (`AUTO_KILL_ON_RISK_BREACH=true`).
 
 ## 3. Cold start / new season
 

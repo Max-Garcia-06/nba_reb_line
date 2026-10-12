@@ -111,6 +111,9 @@ RISKY_BAND_HIGH = float(os.getenv("RISKY_BAND_HIGH", "0.9"))
 RISKY_BAND_KELLY_MULT = float(os.getenv("RISKY_BAND_KELLY_MULT", "1.0"))
 
 # Execution guardrails
+# Widest side bid/ask spread we will quote into. Wide books carry little price
+# information and put maker limits far below fair value (phantom edge).
+MAX_BID_ASK_SPREAD = float(os.getenv("MAX_BID_ASK_SPREAD", "0.08"))
 MIN_LIMIT_PRICE = float(os.getenv("MIN_LIMIT_PRICE", "0.20"))  # avoid tiny-probability longshots by default
 MAX_YES_LINE = float(os.getenv("MAX_YES_LINE", "99"))  # cap YES lines (MLB used 2.0 for TB); 99 = off
 
@@ -193,6 +196,8 @@ MODEL_MAX_DATA_LAG_DAYS = int(os.getenv("MODEL_MAX_DATA_LAG_DAYS", "14"))
 USE_LIVE_BALANCE = os.getenv("USE_LIVE_BALANCE", "true").lower() in ("1", "true", "yes")
 DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "0"))  # 0 = disabled
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0"))  # 0 = disabled; overrides _USD when set
+# Journal dates whose P&L counts toward the loss limit (2 = today + last night's settlements).
+LOSS_LIMIT_LOOKBACK_DAYS = int(os.getenv("LOSS_LIMIT_LOOKBACK_DAYS", "2"))
 MAX_ORDERS_PER_DAY = int(os.getenv("MAX_ORDERS_PER_DAY", "0"))  # 0 = disabled
 MAX_DAILY_DEPLOYED_USD = float(os.getenv("MAX_DAILY_DEPLOYED_USD", "0"))  # 0 = disabled
 MAX_DAILY_DEPLOYED_PCT = float(os.getenv("MAX_DAILY_DEPLOYED_PCT", "0"))  # 0 = disabled; overrides _USD when set

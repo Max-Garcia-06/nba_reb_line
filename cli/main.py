@@ -7,13 +7,25 @@ import uuid
 
 import typer
 
+from cli.output import console
 from pipeline import commands as cmd
+from settings_validate import require_valid_settings
 from structured_logging import configure_structured_logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 configure_structured_logging(run_id=str(uuid.uuid4())[:8])
 
 app = typer.Typer(add_completion=False, help="NBA Rebounds Edge Pipeline")
+
+
+@app.callback()
+def validate_settings_callback() -> None:
+    """Refuse to run any command on invalid .env settings."""
+    try:
+        require_valid_settings()
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
 
 app.command()(cmd.etl)
 app.command()(cmd.train)

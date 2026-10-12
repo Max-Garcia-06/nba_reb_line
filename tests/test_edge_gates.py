@@ -89,3 +89,28 @@ def test_signal_carries_fee_and_preblend_prob(monkeypatch):
     assert sig.p_model_cal == pytest.approx(0.65)
     assert sig.fee_per_contract > 0.0
     assert sig.edge == pytest.approx(sig.p_model - sig.limit_price - sig.fee_per_contract)
+
+
+def test_empty_bid_side_is_never_traded(monkeypatch):
+    # Phantom maker edge: with no YES bid the maker limit lands far below the ask and
+    # "edge" appears even when the model agrees with the market (p_over 0.24 vs ask 0.24).
+    monkeypatch.setattr(edge_detector, "BLOCKED_SEGMENTS", frozenset())
+    monkeypatch.setattr(edge_detector, "MAKER_MODE", True)
+    ml = _ml(line=7.5, yes_bid=0.0, yes_ask=0.24)
+    sig = detect_edge(_pr(0.24, line=7.5), ml, bankroll=1000.0)
+    assert sig is None or sig.recommended_side != "yes"
+
+
+def test_default_spread_gate_rejects_wide_book(monkeypatch):
+    monkeypatch.setattr(edge_detector, "BLOCKED_SEGMENTS", frozenset())
+    monkeypatch.setattr(edge_detector, "MAKER_MODE", True)
+    # 0.40 / 0.60 book (spread 0.20), model 0.70: wide books carry no price information.
+    sig = detect_edge(_pr(0.70, line=7.5), _ml(line=7.5, yes_bid=0.40, yes_ask=0.60), bankroll=1000.0)
+    assert sig is None or sig.recommended_side != "yes"
+
+
+def test_tight_book_still_trades(monkeypatch):
+    monkeypatch.setattr(edge_detector, "BLOCKED_SEGMENTS", frozenset())
+    monkeypatch.setattr(edge_detector, "MAKER_MODE", True)
+    sig = detect_edge(_pr(0.65, line=7.5), _ml(line=7.5, yes_bid=0.48, yes_ask=0.50), bankroll=1000.0)
+    assert sig is not None and sig.recommended_side == "yes"

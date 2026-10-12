@@ -446,6 +446,28 @@ def filter_market_lines_by_start_window(
     return kept, excluded
 
 
+def tip_epoch_by_ticker(
+    market_lines: list,
+    game_date: str,
+    *,
+    schedule_index: dict[str, dict] | None = None,
+    lead_seconds: int = 60,
+) -> dict[str, int]:
+    """
+    Map ticker -> unix seconds ``lead_seconds`` before its game's tip, for use as an
+    order ``expiration_time``. Markets whose game has no known tip time are omitted.
+    """
+    idx = schedule_index if schedule_index is not None else slate_schedule_index(game_date)
+    out: dict[str, int] = {}
+    for ml in market_lines:
+        et = _event_ticker_from_market_line(ml)
+        matchup = parse_kalshi_event_matchup(et) if et else None
+        start = (idx.get(matchup_slug(*matchup)) or {}).get("start_utc") if matchup else None
+        if isinstance(start, datetime):
+            out[ml.ticker] = int(start.timestamp()) - int(lead_seconds)
+    return out
+
+
 def filter_market_lines_pregame(
     market_lines: list,
     game_date: str,

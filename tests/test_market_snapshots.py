@@ -38,3 +38,19 @@ def test_snapshot_refuses_mock_client(monkeypatch):
     with pytest.raises(typer.Exit) as e:
         commands.snapshot(game_date="2026-10-20", series_ticker=None)
     assert e.value.exit_code == 1 and not wrote
+
+
+def test_schedule_snapshots_refuses_mock_client(monkeypatch):
+    import pytest
+    import typer
+
+    import kalshi_bridge
+    import market_snapshots
+    from pipeline import commands
+
+    monkeypatch.setattr(kalshi_bridge, "get_client", lambda: kalshi_bridge.MockKalshiClient())
+    wrote = []
+    monkeypatch.setattr(market_snapshots, "append_snapshots", lambda gd, lines: wrote.append(lines) or 0)
+    with pytest.raises(typer.Exit) as e:
+        commands.schedule_snapshots(game_date="2026-10-20", interval=0, count=1, series_ticker=None)
+    assert e.value.exit_code == 1 and not wrote

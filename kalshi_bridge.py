@@ -98,6 +98,9 @@ class OrderResult:
     contracts: int
     price: float
     message: str = ""
+    # True when the request may have reached the exchange (network error, no HTTP
+    # response): the order's state is unknown and it must not be blindly re-sent.
+    ambiguous: bool = False
 
 
 @dataclass
@@ -112,6 +115,18 @@ class OpenOrder:
     count: int
     remaining_count: int
     created_time: str = ""
+    client_order_id: str = ""
+
+
+def _count(o: dict, fp_key: str, legacy_key: str) -> int:
+    """Whole-contract count from a fixed-point (``*_fp``) or legacy integer field."""
+    for k in (fp_key, legacy_key):
+        if o.get(k) is not None:
+            try:
+                return int(float(o[k]))
+            except (TypeError, ValueError):
+                return 0
+    return 0
 
 
 def _load_private_key(path: str):
@@ -316,7 +331,18 @@ class KalshiClient:
         r.raise_for_status()
         return r.json()
 
-    def place_order(self, ticker: str, side: str, contracts: int, price: float, order_type: str = "limit") -> OrderResult:
+    def place_order(
+        self,
+        ticker: str,
+        side: str,
+        contracts: int,
+        price: float,
+        order_type: str = "limit",
+        *,
+        client_order_id: str = "",
+        post_only: bool = False,
+        expiration_time: int | None = None,
+    ) -> OrderResult:
         side_norm = (side or "").strip().lower()
         # v2 API: bid = buy YES, ask = sell YES (= buy NO at 1 - price)
         if side_norm == "yes":
@@ -335,16 +361,21 @@ class KalshiClient:
             "time_in_force": "good_till_canceled",
             "self_trade_prevention_type": "taker_at_cross",
         }
+        if client_order_id:
+            body["client_order_id"] = client_order_id
+        if post_only:
+            body["post_only"] = True
+        if expiration_time:
+            body["expiration_time"] = int(expiration_time)
         try:
             data = self._post_order("/portfolio/events/orders", body)
             return OrderResult(True, data.get("order_id", ""), ticker, side_norm, contracts, price, "Order placed")
         except requests.HTTPError as e:
             return OrderResult(False, "", ticker, side_norm, contracts, price, str(e))
         except requests.RequestException as e:
-            # Network-level failure (timeout, connection reset/DNS) with no HTTP
-            # response — order state is unknown, but this must not crash the whole
-            # scan cycle. POST is never auto-retried, so no double-submit risk.
-            return OrderResult(False, "", ticker, side_norm, contracts, price, f"Network error: {e}")
+            # Network-level failure with no HTTP response: the order may or may not
+            # have reached the exchange. Flag it so callers never re-send blindly.
+            return OrderResult(False, "", ticker, side_norm, contracts, price, f"Network error: {e}", ambiguous=True)
 
     def get_orders(self, status: str = "resting", ticker: Optional[str] = None, limit: int = 200) -> list[OpenOrder]:
         params: dict = {"status": status, "limit": limit}
@@ -353,20 +384,19 @@ class KalshiClient:
         data = self._get("/portfolio/orders", params=params)
         orders = []
         for o in data.get("orders", []) or []:
-            side = (o.get("side") or "").lower()
-            price = None
-            if o.get("yes_price_dollars") is not None and side == "yes":
-                price = float(o["yes_price_dollars"])
-            elif o.get("no_price_dollars") is not None and side == "no":
-                price = float(o["no_price_dollars"])
-            elif o.get("yes_price") is not None and side == "yes":
-                price = float(o["yes_price"]) / 100
-            elif o.get("no_price") is not None and side == "no":
-                price = float(o["no_price"]) / 100
-            elif o.get("price") is not None:
-                price = float(o["price"])
-            if price is None:
-                price = 0.0
+            # Current schema: outcome_side ('yes'/'no'), *_price_dollars, *_count_fp.
+            # The legacy side/count/remaining_count fields are deprecated and absent.
+            side = str(o.get("outcome_side") or o.get("side") or "").lower()
+            if side not in {"yes", "no"}:
+                side = {"bid": "yes", "ask": "no"}.get(str(o.get("book_side") or "").lower(), side)
+            price = 0.0
+            for k in (f"{side}_price_dollars", f"{side}_price"):
+                if side and o.get(k) is not None:
+                    v = float(o[k])
+                    price = v if k.endswith("_dollars") else v / 100.0
+                    break
+            count = _count(o, "initial_count_fp", "count")
+            remaining = _count(o, "remaining_count_fp", "remaining_count")
             orders.append(
                 OpenOrder(
                     order_id=str(o.get("order_id", "")),
@@ -376,9 +406,10 @@ class KalshiClient:
                     type=str(o.get("type", "")),
                     status=str(o.get("status", "")),
                     price=float(price),
-                    count=int(o.get("count", 0) or 0),
-                    remaining_count=int(o.get("remaining_count", o.get("count", 0)) or 0),
+                    count=count,
+                    remaining_count=remaining,
                     created_time=str(o.get("created_time", "")),
+                    client_order_id=str(o.get("client_order_id", "") or ""),
                 )
             )
         return orders
@@ -418,7 +449,8 @@ class KalshiClient:
         try:
             self._delete(f"/portfolio/events/orders/{order_id}")
             return True
-        except requests.HTTPError:
+        except requests.RequestException as e:
+            log.warning("cancel_order(%s) failed: %s", order_id, e)
             return False
 
     def get_market(self, ticker: str) -> dict:
@@ -546,7 +578,7 @@ class MockKalshiClient:
             return lines
         return [ml for ml in lines if ml.game_date == game_date]
 
-    def place_order(self, ticker: str, side: str, contracts: int, price: float, order_type: str = "limit") -> OrderResult:
+    def place_order(self, ticker: str, side: str, contracts: int, price: float, order_type: str = "limit", **_: object) -> OrderResult:
         log.info(f"[MOCK] {ticker} | {side.upper()} x{contracts} @ {price:.2f}")
         return OrderResult(True, f"mock-{int(datetime.now().timestamp())}", ticker, side, contracts, price, "mock")
 
