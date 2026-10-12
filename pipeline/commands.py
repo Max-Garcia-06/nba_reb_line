@@ -2065,12 +2065,17 @@ def snapshot(
     """Capture a point-in-time snapshot of rebound market prices for backtesting / CLV."""
     from datetime import date as _date
     from config import KALSHI_SERIES
-    from kalshi_bridge import get_client
+    from kalshi_bridge import MockKalshiClient, get_client
     from market_snapshots import append_snapshots
 
     gd = game_date or _date.today().strftime("%Y-%m-%d")
     _header(f"Snapshot rebound markets — {gd}")
     client = get_client()
+    if isinstance(client, MockKalshiClient):
+        # Placeholder books in data/snapshots would be scored by model-vs-market,
+        # refit-blend and backtest as if they were the exchange.
+        _warn("Kalshi mock client active (no credentials in .env) — not writing snapshots.")
+        raise typer.Exit(1)
     lines = client.get_rebound_lines(gd, series_ticker=series_ticker or KALSHI_SERIES)
     n = append_snapshots(gd, lines)
     _success(f"Saved {n} market snapshots for {gd}.")

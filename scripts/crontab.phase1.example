@@ -14,14 +14,17 @@
 # Power: don't add a second macOS repeat-wake alarm — macOS keeps one, and
 # mlb_tb_line's install_power_for_cron.sh owns it.
 
+# Every line appends to logs/: without a redirect cron mails the job's status lines
+# (START/OK/FAILED) to the local mail spool, where nobody reads them.
+
 SHELL=/bin/bash
 PATH=/usr/local/bin:/usr/bin:/bin
 
 # Books every 2h, 12:00-22:00 ET (-> 9 AM-7 PM PDT): full-slate scoring / refit-blend / backtest data
-0 9,11,13,15,17,19 * * * TZ=America/New_York @@REPO@@/scripts/cron_job.sh snapshot
+0 9,11,13,15,17,19 * * * TZ=America/New_York @@REPO@@/scripts/cron_job.sh snapshot >> @@REPO@@/logs/cron.log 2>&1
 
 # Hourly dry-run scans 17:05-23:05 ET (-> 14:05-20:05 PDT); tips ~19:00-22:30 ET, SCAN_WITHIN_HOURS=1.5
-5 14-20 * * * TZ=America/New_York @@REPO@@/scripts/cron_job.sh scan
+5 14-20 * * * TZ=America/New_York @@REPO@@/scripts/cron_job.sh scan >> @@REPO@@/logs/scan.log 2>&1
 
 # Watchdog: kill scan processes stuck >3h
-*/20 * * * * @@REPO@@/scripts/kill_stuck_scans.sh
+*/20 * * * * @@REPO@@/scripts/kill_stuck_scans.sh >> @@REPO@@/logs/cron.log 2>&1

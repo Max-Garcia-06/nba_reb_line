@@ -21,3 +21,20 @@ def test_snapshot_roundtrip(tmp_path, monkeypatch):
     assert len(snaps) == 1
     assert snaps[0].player_name == "Test Player"
     assert snapshot_path("2026-05-20").exists()
+
+
+def test_snapshot_refuses_mock_client(monkeypatch):
+    """Cron snapshots without .env would write placeholder books into the research tape."""
+    import pytest
+    import typer
+
+    import kalshi_bridge
+    import market_snapshots
+    from pipeline import commands
+
+    monkeypatch.setattr(kalshi_bridge, "get_client", lambda: kalshi_bridge.MockKalshiClient())
+    wrote = []
+    monkeypatch.setattr(market_snapshots, "append_snapshots", lambda gd, lines: wrote.append(lines) or 0)
+    with pytest.raises(typer.Exit) as e:
+        commands.snapshot(game_date="2026-10-20", series_ticker=None)
+    assert e.value.exit_code == 1 and not wrote
