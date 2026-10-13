@@ -5,10 +5,20 @@ from __future__ import annotations
 from fees import order_fee_usd
 
 
-def pnl_per_contract(side: str, price: float, result: str) -> float | None:
-    if result not in {"yes", "no"}:
+def pnl_per_contract(side: str, price: float, result: str | float) -> float | None:
+    """
+    P&L of one long contract of ``side`` bought at ``price``. ``result`` is
+    ``"yes"``/``"no"``, or the YES settlement value (dollars) of a market that
+    settled scalar; anything else is unresolved (None).
+    """
+    if isinstance(result, (int, float)) and not isinstance(result, bool):
+        yes_value = float(result)
+    elif result in {"yes", "no"}:
+        yes_value = 1.0 if result == "yes" else 0.0
+    else:
         return None
-    return (1.0 - price) if side == result else (-price)
+    payout = yes_value if str(side).lower() == "yes" else 1.0 - yes_value
+    return payout - float(price)
 
 
 def estimated_order_fee_usd(row: dict, price: float, contracts: int) -> float:
@@ -26,16 +36,40 @@ def market_yes_no_result(market: dict) -> str:
     return str((market or {}).get("result") or "").lower()
 
 
+def market_settlement(market: dict) -> str | float:
+    """
+    ``"yes"``/``"no"`` for a binary settlement, the YES settlement value (float,
+    dollars) for a ``scalar`` one — Kalshi settles a player who did not play at a
+    fixed price — else ``""`` (unsettled). Feed it to :func:`pnl_per_contract`.
+    """
+    res = market_yes_no_result(market)
+    if res in {"yes", "no"}:
+        return res
+    if res == "scalar":
+        m = market or {}
+        for k, scale in (("settlement_value_dollars", 1.0), ("settlement_value", 100.0)):
+            v = m.get(k)
+            if v in (None, ""):
+                continue
+            try:
+                val = float(v) / scale
+            except (TypeError, ValueError):
+                continue
+            if 0.0 <= val <= 1.0:
+                return val
+    return ""
+
+
 def line_bucket(line: float) -> str:
-    """Kalshi TB strike bucket for segment reporting."""
+    """NBA rebound strike bucket for segment reporting (Kalshi lines run 1.5–19.5)."""
     ln = float(line)
-    if ln <= 0.5:
-        return "0.5"
-    if ln <= 1.5:
-        return "1.5"
-    if ln <= 2.5:
-        return "2.5"
-    return "3.5+"
+    if ln <= 4.5:
+        return "<=4.5"
+    if ln <= 7.5:
+        return "5.5-7.5"
+    if ln <= 10.5:
+        return "8.5-10.5"
+    return ">=11.5"
 
 
 def price_bucket(price: float) -> str:

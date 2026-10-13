@@ -45,7 +45,7 @@ from edge_detector import fill_calibrated_probabilities
 from feature_store import build_feature_table
 from identity_bridge import PlayerIndex
 from market_blend import fit_blend_weight
-from market_snapshots import load_snapshots
+from market_snapshots import load_snapshots_before_tip
 from probability_engine import calculate_probabilities
 
 log = logging.getLogger(__name__)
@@ -84,12 +84,25 @@ def _features() -> pd.DataFrame:
     return _FEATURES
 
 
-def _market_rows_snapshots(game_date: str, earliest: bool) -> pd.DataFrame:
-    snaps = load_snapshots(game_date, latest_only=not earliest, earliest_only=earliest)
-    return pd.DataFrame([{
-        "ticker": s.ticker, "event_ticker": s.event_ticker, "player_name": s.player_name,
-        "line": float(s.line), "yes_bid": float(s.yes_bid), "yes_ask": float(s.yes_ask),
-    } for s in snaps])
+def _market_rows_snapshots(game_date: str, earliest: bool, lead_min: int = HISTORY_LEAD_MIN) -> pd.DataFrame:
+    """Live-snapshot books, latest (or earliest) capture at least ``lead_min`` before tip."""
+    from journal_risk import game_slug_from_ticker
+    from market_snapshots import _parse_captured_at_utc
+
+    snaps = load_snapshots_before_tip(game_date, lead_min=lead_min, earliest=earliest)
+    if not snaps:
+        return pd.DataFrame()
+    idx = de.slate_schedule_index(game_date)
+    out = []
+    for s in snaps:
+        start = (idx.get(game_slug_from_ticker(s.ticker)) or {}).get("start_utc")
+        cap = _parse_captured_at_utc(s.captured_at)
+        out.append({
+            "ticker": s.ticker, "event_ticker": s.event_ticker, "player_name": s.player_name,
+            "line": float(s.line), "yes_bid": float(s.yes_bid), "yes_ask": float(s.yes_ask),
+            "decision_ts": int(cap.timestamp()), "tip_ts": int(start.timestamp()), "source": "snapshot",
+        })
+    return pd.DataFrame(out)
 
 
 def _market_rows_history(game_date: str, lead_min: int = HISTORY_LEAD_MIN) -> pd.DataFrame:
@@ -108,10 +121,17 @@ def _market_rows_history(game_date: str, lead_min: int = HISTORY_LEAD_MIN) -> pd
         log.debug("history rows unavailable for %s: %s", game_date, e)
         return pd.DataFrame()
     mk = mk.merge(sch, on="teams_code", how="inner")
-    tip = pd.to_datetime(mk["TIP_UTC"], utc=True).dt.as_unit("s").astype("int64")  # unit-safe
+    tip_dt = pd.to_datetime(mk["TIP_UTC"], utc=True)
+    # A NaT tip (postponed game) would cast to int64 min and pass every cutoff.
+    mk, tip_dt = mk[tip_dt.notna()], tip_dt[tip_dt.notna()]
+    tip = tip_dt.dt.as_unit("s").astype("int64")  # unit-safe
     c = c.merge(pd.DataFrame({"ticker": mk["ticker"], "tip_ts": tip}), on="ticker")
     c = c[(c["end_ts"] <= c["tip_ts"] - lead_min * 60)].sort_values("end_ts").groupby("ticker").tail(1)
-    return mk.drop(columns=["TIP_UTC", "teams_code"]).merge(c[["ticker", "yes_bid", "yes_ask"]], on="ticker")
+    c = c.rename(columns={"end_ts": "decision_ts"})
+    out = mk.drop(columns=["TIP_UTC", "teams_code"]).merge(
+        c[["ticker", "yes_bid", "yes_ask", "decision_ts", "tip_ts"]], on="ticker")
+    out["source"] = "candles"
+    return out
 
 
 def _resolve(rows: pd.DataFrame, game_date: str) -> pd.DataFrame:
@@ -208,8 +228,13 @@ def _pit_model(game_date: str, pit_train: bool):
 # Scoring
 # ---------------------------------------------------------------------------
 
-def evaluate_day(game_date: str, *, pit_train: bool = True, earliest: bool = False) -> list[ScoreRow]:
-    """Score one day's full slate. Returns [] when markets/outcomes are missing."""
+def evaluate_day(
+    game_date: str, *, pit_train: bool = True, earliest: bool = False, zero_vacuum: bool = False
+) -> list[ScoreRow]:
+    """
+    Score one day's full slate. Returns [] when markets/outcomes are missing.
+    ``zero_vacuum`` zeroes teammate-absence features (hindsight sensitivity).
+    """
     rows = _market_rows_snapshots(game_date, earliest)
     if rows.empty:
         rows = _market_rows_history(game_date)
@@ -225,6 +250,9 @@ def evaluate_day(game_date: str, *, pit_train: bool = True, earliest: bool = Fal
     feats = _features()
     feats = feats[pd.to_datetime(feats["GAME_DATE"]).dt.strftime("%Y-%m-%d") == game_date]
     feats = feats.set_index(["PLAYER_ID", "GAME_ID"])
+    if zero_vacuum:
+        feats = feats.copy()
+        feats[["vacuum_reb", "vacuum_min", "vacuum_n"]] = 0
     keys = list(zip(rows["PLAYER_ID"], rows["GAME_ID"]))
     have = [k in feats.index for k in keys]
     rows = rows[have].reset_index(drop=True)
@@ -258,6 +286,36 @@ def _logloss(rows: list[ScoreRow], key: str) -> float:
 
 def _brier(rows: list[ScoreRow], key: str) -> float:
     return sum((getattr(r, key) - r.y) ** 2 for r in rows) / len(rows)
+
+
+def day_bootstrap_dll_ci(
+    rows: list[ScoreRow], *, n_boot: int = 2000, seed: int = 0, alpha: float = 0.05
+) -> tuple[float, float, float]:
+    """
+    ΔLL (model − market log-loss; negative = model better) with a paired
+    bootstrap CI that resamples whole days, since markets on one slate share
+    news and are not independent.
+    """
+    import random
+
+    def _ll(p: float, y: float) -> float:
+        p = min(1 - 1e-4, max(1e-4, p))
+        return -(y * np.log(p) + (1 - y) * np.log(1 - p))
+
+    by_day: dict[str, list[float]] = defaultdict(list)
+    for r in rows:
+        by_day[r.game_date].append(_ll(r.p_model_cal, r.y) - _ll(r.p_market_mid, r.y))
+    days = list(by_day.values())
+    if not days:
+        return 0.0, 0.0, 0.0
+    point = float(sum(sum(d) for d in days) / sum(len(d) for d in days))
+    rng = random.Random(seed)
+    stats = []
+    for _ in range(n_boot):
+        smp = [days[rng.randrange(len(days))] for _ in days]
+        stats.append(sum(sum(d) for d in smp) / sum(len(d) for d in smp))
+    stats.sort()
+    return point, float(stats[int(alpha / 2 * n_boot)]), float(stats[min(n_boot - 1, int((1 - alpha / 2) * n_boot))])
 
 
 def disagreement_bucket(r: ScoreRow) -> str:

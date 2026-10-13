@@ -135,15 +135,39 @@ signature MLB found. Per-bucket blend weights exist for exactly this.
 | Nov–Mar (fit for holdout test) | 0.33 | 0.67 | 0.37 | 0.33 | 0.09 |
 | Nov–Jun (production, 2026-10-08) | 0.40 | 0.73 | 0.46 | 0.44 | 0.14 |
 
-**Out-of-sample stack backtest** (Apr 1 – Jun 13 2026, weights fit on
-Nov–Mar only, full scan stack incl. fees, maker limits, Kelly, heuristic fill
-model): 82 trades, +$109.46 on $445.28, ROI +24.6% (day-bootstrap 95% CI
-+7% to +41%). Treat as *suggestive, not proven*: n is small and mostly
-playoffs; the realised win rate (0.73) beat the model's own mean probability
-(0.68), which points at luck; the fill model ignores adverse selection on
-resting maker orders; and full-slate log-loss says the model only ties the
-market. The first weeks of 2026-27 should run dry-run, then small live,
-judged on net-of-fee P&L and CLV as in MLB §6.
+**Out-of-sample stack backtest, superseded.** The 2026-10-08 figure (82 trades,
+ROI +24.6%, CI +7% to +41%) used blend weights swapped in by hand, a spread-based fill
+heuristic that filled at least 25% of every order whether or not anything traded, and
+books with no tip cutoff. Do not quote it.
+
+**Holdout rerun, 2026-10-12** (Apr 1 – Jun 13 2026; walk-forward weekly blend weights
+fit only on earlier full-slate scores since 2025-11-01; pregame books only; fees,
+maker limits, Kelly, live gates incl. bid > 0 and spread ≤ 0.08):
+
+| Variant | Signals | Filled | ROI | Day-bootstrap 95% CI | CLV / contract |
+|---|---|---|---|---|---|
+| Fills from trades/quotes before tip (default) | 178 | 100 (56%) | +16.5% | −6.6% to +37.9% | −0.0026 |
+| Everything fills (upper bound) | 178 | 178 | +17.1% | +1.1% to +33.6% | +0.0054 |
+| Teammate-absence features zeroed | 27 | 9 | −23.4% | −71% to +15% | −0.0062 |
+
+Full-slate model vs market (Nov 18 2025 – Jun 13 2026, 16,137 markets, PIT):
+ΔLL +0.0021 (model slightly worse), paired day-bootstrap CI −0.0014 to +0.0056 —
+**not distinguishable from zero**. The ≥0.15 disagreement bucket is still clearly
+worse (ΔLL +0.065, n=557).
+
+Reading:
+
+* With realistic fills the edge is **not statistically established**: the CI spans
+  zero, and CLV on filled orders is negative. Resting orders fill when the price moves
+  against them (adverse selection), and the fills that do happen win 54% against a
+  model mean of 0.565.
+* Most signals depend on the teammate-absence features. History knows every late
+  scratch; the live scan only knows ESPN's OUT list. Zeroing those features is a
+  pessimistic bound (it creates the opposite skew), but the drop from 178 to 27
+  signals means the edge is concentrated exactly where the backtest has hindsight.
+* Before small live: run the dry-run paper journal (`report-range --paper`) and judge
+  it on net P&L and close CLV; rebuild historical absences from time-stamped injury
+  reports (Tier 4) before trusting any backtest that uses them.
 
 ## 6. Trading stack (ported from MLB, see MLB SYSTEM.md §3)
 

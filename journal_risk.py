@@ -17,7 +17,7 @@ from journal_reader import (
     placed_with_order_id,
 )
 from kalshi_bridge import read_price_from_market_dict
-from reporting_common import market_yes_no_result, pnl_per_contract
+from reporting_common import market_settlement, pnl_per_contract
 from trade_journal import journal_path
 
 if TYPE_CHECKING:
@@ -231,7 +231,7 @@ def _pnl_for_date(
             contracts_by_game[slug] = contracts_by_game.get(slug, 0) + filled
 
         market = markets.get(ticker, {})
-        pnlpc = pnl_per_contract(side, price, market_yes_no_result(market))
+        pnlpc = pnl_per_contract(side, price, market_settlement(market))
         if pnlpc is not None:
             realized += pnlpc * filled
             continue

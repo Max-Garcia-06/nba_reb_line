@@ -19,8 +19,9 @@ Kalshi ◄──scan──────┘  slate.py: markets → (player, team, 
    │                   → PMF → P(REB > k) → calibrate → blend w/ market (per bucket)
    │                   → fee-adjusted edge vs maker/taker limit → Kelly → risk gates
    ├──► data/trades_YYYY-MM-DD.jsonl  (journal)   ──► reconcile ──► report / report-range
+   ├──► data/paper/trades_*.jsonl     (dry-run)   ──► report-range --paper
    ├──► data/snapshots/*.jsonl        (books)     ──► model-vs-market / refit-blend / backtest
-   └──► CLV marks (15/30/60/90m)                  ──► segment-report
+   └──► CLV marks (15/30/60m after each order + close before tip) ──► segment-report
 ```
 
 | Phase | Command(s) | Output |
@@ -99,10 +100,28 @@ tonight's game or has fewer than `GAMES_FOR_LAMBDA_SANITY` games.
 
 ```bash
 .venv/bin/python run_pipeline.py report-range --start <d> --end <d>   # net-of-fee P&L = truth
-.venv/bin/python run_pipeline.py model-vs-market --start <d> --end <d> # full-slate, PIT
+.venv/bin/python run_pipeline.py report-range --paper --start <d> --end <d>  # dry-run trial
+.venv/bin/python run_pipeline.py model-vs-market --start <d> --end <d> # full-slate, PIT, ΔLL CI
 .venv/bin/python run_pipeline.py segment-report                        # CLV go/no-go
 .venv/bin/python run_pipeline.py calibrate                             # once >=50 fills
 ```
+
+Evaluation rules (2026-10, see SYSTEM.md §5):
+
+- Books used for scoring, blend refits and backtests are pregame only (at least 60 min
+  before tip); in-game snapshots are never read.
+- `backtest` is walk-forward by default: each week trades on blend weights fit only on
+  earlier full-slate scores (`--blend saved` reproduces the old in-sample behaviour).
+  Resting orders fill only when trades or quotes reached the limit before tip
+  (`--fill-model none` = everything fills, an upper bound). `--zero-vacuum` bounds the
+  hindsight in teammate-absence features. ROI comes with a day-bootstrap 95% CI.
+- `mark` labels every mark (15m/30m/60m after the order's own placement, `close` in the
+  last 10 min before tip) and never marks after tip. Marks without a label are legacy
+  and ignored by `segment-report`.
+- A dry-run `scan` journals paper orders to `data/paper/` and schedules paper marks.
+- `reconcile` re-checks an order until it is executed or canceled, and books the fees
+  Kalshi actually charged. `scalar` settlements (player did not play) settle at their
+  settlement value; ROI uses resolved cost only.
 
 Then, and only with evidence: `BLOCKED_SEGMENTS`, `RISKY_BAND_KELLY_MULT`, `MAX_YES_LINE`,
 `REQUIRE_FILL_CALIB_FOR_LIVE=1` once a fill calibrator exists.

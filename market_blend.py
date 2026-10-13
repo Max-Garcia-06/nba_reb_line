@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -26,6 +27,7 @@ from config import (
     BLEND_META_PATH,
     BLEND_WEIGHT_OVERRIDE,
     DEFAULT_BLEND_WEIGHT,
+    MIN_BLEND_ROWS,
     MIN_BLEND_ROWS_SEGMENT,
     MIN_BLEND_WEIGHT,
     SEGMENT_BLEND_META_PATH,
@@ -173,6 +175,39 @@ def fit_blend_weight(rows: list[dict], step: float = 0.01) -> tuple[float, dict]
         "n_rows": len(rows),
     }
     return round(best_w, 4), diag
+
+
+def fit_blend_weights(rows: list[dict]) -> tuple[float, dict[str, float]]:
+    """
+    Global and per-disagreement-bucket blend weights from scored rows (``p`` model,
+    ``m`` market mid, ``y`` outcome), with the live loader's rules: a slice below its
+    minimum row count is not fit (global falls back to DEFAULT_BLEND_WEIGHT, a
+    bucket to the global), and every weight is floored at MIN_BLEND_WEIGHT.
+    """
+    def _floor(w: float) -> float:
+        return min(1.0, max(MIN_BLEND_WEIGHT, float(w)))
+
+    global_w = float(DEFAULT_BLEND_WEIGHT)
+    if len(rows) >= MIN_BLEND_ROWS:
+        global_w = _floor(fit_blend_weight(rows)[0])
+    by_bucket: dict[str, list[dict]] = {}
+    for r in rows:
+        by_bucket.setdefault(disagreement_bucket(r["p"], r["m"]), []).append(r)
+    segments = {
+        b: _floor(fit_blend_weight(rs)[0]) for b, rs in by_bucket.items() if len(rs) >= MIN_BLEND_ROWS_SEGMENT
+    }
+    return global_w, segments
+
+
+@contextmanager
+def pinned_blend_weights(global_w: float, segments: dict[str, float]):
+    """Use these weights instead of models/blend_meta*.json (walk-forward backtests)."""
+    global _CACHED_WEIGHT, _CACHED_SEGMENT_WEIGHTS
+    _CACHED_WEIGHT, _CACHED_SEGMENT_WEIGHTS = float(global_w), dict(segments)
+    try:
+        yield
+    finally:
+        reset_blend_cache()
 
 
 def save_blend_meta(w: float, diag: dict, *, start: str, end: str) -> None:

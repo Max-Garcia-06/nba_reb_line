@@ -13,12 +13,14 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def journal_path(game_date: str) -> Path:
-    return Path(DATA_DIR) / f"trades_{game_date}.jsonl"
+def journal_path(game_date: str, *, paper: bool = False) -> Path:
+    """Live journal, or the dry-run paper journal under ``data/paper/``."""
+    root = Path(DATA_DIR) / "paper" if paper else Path(DATA_DIR)
+    return root / f"trades_{game_date}.jsonl"
 
 
-def append_row(game_date: str, row: dict[str, Any]) -> None:
-    p = journal_path(game_date)
+def append_row(game_date: str, row: dict[str, Any], *, paper: bool = False) -> None:
+    p = journal_path(game_date, paper=paper)
     p.parent.mkdir(parents=True, exist_ok=True)
     row = dict(row)
     row.setdefault("ts", _utc_now_iso())
@@ -52,6 +54,7 @@ class TradeRow:
     book_spread: float = 0.0
     filled_contracts: int = 0
     avg_fill_price: float = 0.0
+    order_status: str = ""  # Kalshi order status at reconcile time (fill rows)
     mark_label: str = ""
     mark_yes_bid: float = 0.0
     mark_yes_ask: float = 0.0

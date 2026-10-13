@@ -69,12 +69,3 @@ def finalize_signals(
             s.bet_dollars = round(s.recommended_contracts * s.limit_price, 2)
 
     return [s for s in signals if s.recommended_contracts > 0]
-
-
-def fill_probability(spread: float, *, side: str = "yes") -> float:
-    """Heuristic limit-fill probability from book spread (tighter = more likely)."""
-    sp = max(0.0, float(spread))
-    base = max(0.25, 1.0 - sp / 0.25)
-    if str(side).lower() == "no" and sp > 0.12:
-        base *= 0.92
-    return min(1.0, max(0.0, base))

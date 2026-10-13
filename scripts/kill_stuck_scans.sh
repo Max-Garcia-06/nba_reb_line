@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Watchdog: kill any run_pipeline.py scan process that has run longer than
-# MAX_AGE_SECONDS. A normal scan (including its 30m/120m auto-mark sleep)
+# MAX_AGE_SECONDS. A normal scan (its auto-mark runs are separate background processes)
 # finishes well under this; anything older is stuck (e.g. survived a
 # system sleep/wake with a hung network call) and blocks reconcile/report
 # from seeing that day's fills.

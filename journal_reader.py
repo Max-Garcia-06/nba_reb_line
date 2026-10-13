@@ -5,11 +5,41 @@ Shared helpers for reading trade journals (JSONL) and common indexes used by rep
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from config import DATA_DIR
+
+
+# CLV marks: offsets after each order's own placement, plus one closing mark just
+# before tip. Nothing is marked once the game has started (in-game prices carry
+# outcome information).
+MARK_OFFSETS_MIN = (15, 30, 60)
+CLOSE_MARK_LABEL = "close"
+CLOSE_MARK_WINDOW_MIN = 10  # a close mark is taken in the last N minutes before tip
+MARK_GRACE_MIN = 10  # an offset mark taken later than offset + grace would be mislabeled
+MARK_LABELS = tuple(f"{d}m" for d in MARK_OFFSETS_MIN) + (CLOSE_MARK_LABEL,)
+
+
+def due_mark_labels(
+    placed_at: datetime,
+    tip: datetime | None,
+    now: datetime,
+    done: set[str],
+) -> list[str]:
+    """Mark labels to capture for one order at ``now`` (none without a known, future tip)."""
+    if tip is None or now >= tip:
+        return []
+    out = []
+    for d in MARK_OFFSETS_MIN:
+        label = f"{d}m"
+        due = placed_at + timedelta(minutes=d)
+        if label not in done and due <= now <= due + timedelta(minutes=MARK_GRACE_MIN):
+            out.append(label)
+    if CLOSE_MARK_LABEL not in done and now >= tip - timedelta(minutes=CLOSE_MARK_WINDOW_MIN):
+        out.append(CLOSE_MARK_LABEL)
+    return out
 
 
 def parse_iso_date(s: str) -> datetime:
@@ -37,14 +67,15 @@ def load_jsonl_rows(path: Path) -> list[dict[str, Any]]:
     return out
 
 
-def journal_paths_sorted() -> list[Path]:
-    return sorted(DATA_DIR.glob("trades_*.jsonl"))
+def journal_paths_sorted(*, paper: bool = False) -> list[Path]:
+    root = DATA_DIR / "paper" if paper else DATA_DIR
+    return sorted(root.glob("trades_*.jsonl"))
 
 
-def journal_paths_in_date_range(start_d: datetime, end_d: datetime) -> list[tuple[Path, str]]:
+def journal_paths_in_date_range(start_d: datetime, end_d: datetime, *, paper: bool = False) -> list[tuple[Path, str]]:
     """Paths whose embedded YYYY-MM-DD falls in [start_d, end_d] inclusive."""
     out: list[tuple[Path, str]] = []
-    for p in journal_paths_sorted():
+    for p in journal_paths_sorted(paper=paper):
         d = date_from_journal_filename(p)
         if not d:
             continue

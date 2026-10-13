@@ -56,7 +56,7 @@ def _gates_before_model(monkeypatch):
 def _scan_kwargs(**over):
     kw = dict(game_date=DATE, bankroll=1000.0, threshold=None, min_p=None, tail_p_cutoff=None,
               tail_edge_mult=None, max_signals=None, one_per_player=True, max_contracts=250,
-              series_ticker="KXNBAREB", dry_run=True, auto_mark=False, mark_delays="")
+              series_ticker="KXNBAREB", dry_run=True, auto_mark=False)
     kw.update(over)
     return kw
 

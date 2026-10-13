@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from edge_detector import EdgeSignal
-from trading_stack import fill_probability, finalize_signals
+from trading_stack import finalize_signals
 
 
 def _sig(ev: float, player: str) -> EdgeSignal:
@@ -33,7 +33,3 @@ def test_finalize_one_per_player():
     names = {x.player_name for x in s}
     assert names == {"A", "B"}
     assert next(x for x in s if x.player_name == "A").ev == 0.2
-
-
-def test_fill_probability_tighter_spread():
-    assert fill_probability(0.02) > fill_probability(0.20)

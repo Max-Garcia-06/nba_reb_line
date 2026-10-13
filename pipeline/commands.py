@@ -14,6 +14,7 @@ from rich import box
 from rich.table import Table
 
 from cli.output import console, _header, _success, _warn
+from journal_reader import MARK_LABELS
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +91,36 @@ def evaluate(
     console.print(bakeoff.summary().round(4).to_string(index=False))
 
 
+def _schedule_marks(game_date: str, signals, tip_epoch_by_ticker: dict[str, int], *, paper: bool) -> None:
+    """
+    Spawn background `mark` runs at the 15/30/60-minute offsets and just before
+    each traded game's tip. `mark` decides what is due, so extra runs are harmless.
+    """
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    import run_pipeline as _rp
+    from journal_reader import CLOSE_MARK_WINDOW_MIN, MARK_OFFSETS_MIN
+
+    now = time.time()
+    delays = {float(d) * 60 + 30 for d in MARK_OFFSETS_MIN}
+    for s in signals:
+        tip = tip_epoch_by_ticker.get(s.ticker)
+        if tip:
+            # tip_epoch_by_ticker values are tip - lead; aim inside the close window.
+            delays.add(max(0.0, tip - now - (CLOSE_MARK_WINDOW_MIN / 2) * 60))
+    argv = [sys.executable, str(Path(_rp.__file__).resolve()), "mark", "--date", game_date] + (["--paper"] if paper else [])
+    log_path = Path(_rp.__file__).resolve().parent / "logs" / "mark.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for d in sorted(delays):
+        cmd = [sys.executable, "-c", f"import time,subprocess; time.sleep({d:.0f}); subprocess.run({argv!r}, check=False)"]
+        with open(log_path, "a") as lf:
+            subprocess.Popen(cmd, stdout=lf, stderr=lf)
+    console.print(f"[dim]Scheduled {len(delays)} mark run(s) (log: {log_path}).[/dim]")
+
+
 def _sweep_resting_orders(client, game_date: str, series_ticker: str, keep: set[tuple[str, str]]) -> None:
     """Cancel today's resting orders the scan did not re-confirm; exit 1 if that can't be checked."""
     from edge_detector import cancel_unconfirmed_orders
@@ -116,8 +147,7 @@ def scan(
     max_contracts: int = typer.Option(250, "--max-contracts"),
     series_ticker: str = typer.Option(None, "--series-ticker", help="Kalshi series ticker (default: KALSHI_SERIES)."),
     dry_run: bool = typer.Option(True, "--dry-run/--live"),
-    auto_mark: bool = typer.Option(True, "--auto-mark/--no-auto-mark", help="Automatically record CLV marks after scan (live mode only)."),
-    mark_delays: str = typer.Option("15,30,60,90", "--mark-delays", help="Comma-separated minutes after scan to record marks, e.g. '15,30,60,90'."),
+    auto_mark: bool = typer.Option(True, "--auto-mark/--no-auto-mark", help="Schedule CLV marks (15/30/60m after placement + close before tip)."),
 ):
     from config import (
         BASE_DIR,
@@ -438,64 +468,51 @@ def scan(
                     console.print("[red]Kill switch activated.[/red]")
                 raise typer.Exit(1)
             keep |= {(s.ticker, s.recommended_side) for s in signals}
-            results = execute_signals(
-                signals, client=client, expiration_by_ticker=tip_epoch_by_ticker(market_lines, game_date)
-            )
+            expiration_by_ticker = tip_epoch_by_ticker(market_lines, game_date)
+            results = execute_signals(signals, client=client, expiration_by_ticker=expiration_by_ticker)
             if auto_mark and results:
-                import subprocess
-                import sys
-                from pathlib import Path
-
-                import run_pipeline as _rp
-
-                delays = []
-                for part in str(mark_delays).split(","):
-                    part = part.strip()
-                    if not part:
-                        continue
-                    try:
-                        delays.append(int(part))
-                    except Exception:
-                        continue
-                delays = sorted(set([d for d in delays if d > 0]))
-                if delays:
-                    _script = str(Path(_rp.__file__).resolve())
-                    for d in delays:
-                        label = f"{d}m"
-                        argv = [sys.executable, _script, "mark", "--date", game_date, "--label", label]
-                        cmd = [
-                            sys.executable,
-                            "-c",
-                            "import time,subprocess,sys; "
-                            f"time.sleep({int(d)}*60); "
-                            f"subprocess.run({repr(argv)}, check=False)",
-                        ]
-                        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    console.print(f"\n[dim]Auto-mark scheduled at: {', '.join(f'{d}m' for d in delays)}[/dim]")
+                _schedule_marks(game_date, signals, expiration_by_ticker, paper=False)
             _email_scan_summary(game_date, signals, total_xp, results=results)
         else:
-            _warn("Dry run — no orders placed. Use --live to execute.")
+            from data_engine import tip_epoch_by_ticker
+            from paper_trading import record_paper_orders
+
+            n_paper = record_paper_orders(game_date, signals)
+            _warn(f"Dry run — no orders placed ({n_paper} new paper order(s) journaled). Use --live to execute.")
+            if auto_mark and n_paper:
+                _schedule_marks(game_date, signals, tip_epoch_by_ticker(market_lines, game_date), paper=True)
             _email_scan_summary(game_date, signals, total_xp, results=None)
     finally:
         if not dry_run:
             _sweep_resting_orders(client, game_date, series_ticker, keep)
 
 
+def _utc_now() -> datetime:
+    from datetime import timezone
+
+    return datetime.now(timezone.utc)
+
+
 def mark(
     game_date: str = typer.Option(None, "--date", help="Game date YYYY-MM-DD. Defaults to today."),
-    label: str = typer.Option("30m", "--label", help="Mark label, e.g. '30m', '120m'."),
+    paper: bool = typer.Option(False, "--paper", help="Mark the dry-run paper journal instead of live orders."),
 ):
     """
-    Snapshot current market prices for placed orders and write `note=mark` rows.
-    Used for CLV / mark-to-market diagnostics.
+    Record CLV marks (`note=mark` rows) for placed orders: at 15/30/60 min after
+    each order's own placement and a closing mark in the last minutes before tip.
+    Idempotent and safe to run often; nothing is marked once a game has started.
     """
-    from journal_reader import load_jsonl_rows, placed_with_order_id
+    from datetime import timezone
+    from types import SimpleNamespace
+
+    from data_engine import tip_epoch_by_ticker
+    from journal_reader import due_mark_labels, load_jsonl_rows, placed_with_order_id
     from kalshi_bridge import get_client, read_price_from_market_dict
     from trade_journal import TradeRow, append_row, journal_path
 
     game_date = game_date or datetime.today().strftime("%Y-%m-%d")
-    path = journal_path(game_date)
-    _header(f"Mark snapshot — {game_date} ({label})")
+    path = journal_path(game_date, paper=paper)
+    _header(f"Mark snapshot — {game_date}{' (paper)' if paper else ''}")
 
     if not path.exists():
         _warn(f"No trade journal found at {path}")
@@ -507,61 +524,83 @@ def mark(
         _warn("No placed orders found to mark.")
         raise typer.Exit(0)
 
-    existing = {(str(r.get("order_id")), str(r.get("mark_label"))) for r in rows if r.get("note") == "mark" and r.get("order_id")}
+    done: dict[str, set[str]] = defaultdict(set)
+    for r in rows:
+        if r.get("note") == "mark" and r.get("order_id"):
+            done[str(r["order_id"])].add(str(r.get("mark_label", "")))
 
+    tickers = sorted({str(r.get("ticker", "")) for r in placed})
+    tips = tip_epoch_by_ticker([SimpleNamespace(ticker=t, event_ticker="") for t in tickers], game_date, lead_seconds=0)
+    now = _utc_now()
     client = get_client()
+    markets: dict[str, dict] = {}
 
     wrote = 0
     for r in placed:
         oid = str(r.get("order_id"))
-        if (oid, str(label)) in existing:
-            continue
         ticker = str(r.get("ticker", ""))
         try:
-            m = client.get_market(ticker) or {}
-        except Exception:
-            m = {}
+            placed_at = datetime.fromisoformat(str(r.get("ts", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if placed_at.tzinfo is None:
+            placed_at = placed_at.replace(tzinfo=timezone.utc)
+        tip = datetime.fromtimestamp(tips[ticker], tz=timezone.utc) if ticker in tips else None
+        labels = due_mark_labels(placed_at, tip, now, done[oid])
+        if not labels:
+            continue
+        if ticker not in markets:
+            try:
+                markets[ticker] = client.get_market(ticker) or {}
+            except Exception:
+                markets[ticker] = {}
+        m = markets[ticker]
 
         yes_bid = read_price_from_market_dict(m, "yes_bid_dollars", "yes_bid")
         yes_ask = read_price_from_market_dict(m, "yes_ask_dollars", "yes_ask")
         no_bid = read_price_from_market_dict(m, "no_bid_dollars", "no_bid")
         no_ask = read_price_from_market_dict(m, "no_ask_dollars", "no_ask")
-        # Mid-price fallback: prefer (bid+ask)/2, else fall back to whichever side we have.
-        yes_mid = (yes_bid + yes_ask) / 2 if (yes_bid > 0 and yes_ask > 0) else (yes_ask or yes_bid or 0.0)
-        no_mid = (no_bid + no_ask) / 2 if (no_bid > 0 and no_ask > 0) else (no_ask or no_bid or 0.0)
+        # Two-sided mids only: a one-sided book has no meaningful mark.
+        yes_mid = (yes_bid + yes_ask) / 2 if (yes_bid > 0 and yes_ask > 0) else 0.0
+        no_mid = (no_bid + no_ask) / 2 if (no_bid > 0 and no_ask > 0) else 0.0
 
-        append_row(
-            game_date,
-            TradeRow(
-                game_date=game_date,
-                ticker=ticker,
-                side=str(r.get("side", "")),
-                action=str(r.get("action", "buy")),
-                contracts=int(r.get("contracts", 0) or 0),
-                limit_price=float(r.get("limit_price", 0.0) or 0.0),
-                order_id=oid,
-                player_name=str(r.get("player_name", "")),
-                kalshi_line=float(r.get("kalshi_line", 0.0) or 0.0),
-                predicted_lambda=float(r.get("predicted_lambda", 0.0) or 0.0),
-                p_model=float(r.get("p_model", 0.0) or 0.0),
-                p_model_raw=float(r.get("p_model_raw", 0.0) or 0.0),
-                p_market=float(r.get("p_market", 0.0) or 0.0),
-                mark_yes_bid=float(yes_bid),
-                mark_yes_ask=float(yes_ask),
-                mark_no_bid=float(no_bid),
-                mark_no_ask=float(no_ask),
-                mark_yes_mid=float(yes_mid),
-                mark_no_mid=float(no_mid),
-                note="mark",
-                success=True,
-            ).to_dict(),
-        )
-        wrote += 1
+        for label in labels:
+            append_row(
+                game_date,
+                TradeRow(
+                    game_date=game_date,
+                    ticker=ticker,
+                    side=str(r.get("side", "")),
+                    action=str(r.get("action", "buy")),
+                    contracts=int(r.get("contracts", 0) or 0),
+                    limit_price=float(r.get("limit_price", 0.0) or 0.0),
+                    order_id=oid,
+                    player_name=str(r.get("player_name", "")),
+                    kalshi_line=float(r.get("kalshi_line", 0.0) or 0.0),
+                    predicted_lambda=float(r.get("predicted_lambda", 0.0) or 0.0),
+                    p_model=float(r.get("p_model", 0.0) or 0.0),
+                    p_model_raw=float(r.get("p_model_raw", 0.0) or 0.0),
+                    p_market=float(r.get("p_market", 0.0) or 0.0),
+                    mark_label=label,
+                    mark_yes_bid=float(yes_bid),
+                    mark_yes_ask=float(yes_ask),
+                    mark_no_bid=float(no_bid),
+                    mark_no_ask=float(no_ask),
+                    mark_yes_mid=float(yes_mid),
+                    mark_no_mid=float(no_mid),
+                    note="mark",
+                    success=True,
+                ).to_dict(),
+                paper=paper,
+            )
+            done[oid].add(label)
+            wrote += 1
 
     if wrote:
         _success(f"Wrote {wrote} mark row(s).")
     else:
-        _warn("No new mark rows written (already marked or no prices).")
+        _warn("No marks due (already marked, not yet due, or games started).")
+
 
 def report(
     game_date: str = typer.Option(None, "--date", help="Game date YYYY-MM-DD. Defaults to today."),
@@ -577,7 +616,7 @@ def report(
         placed_post_submit,
     )
     from kalshi_bridge import get_client
-    from reporting_common import edge_bucket, estimated_order_fee_usd, market_yes_no_result, pnl_per_contract, price_bucket, spread_bucket
+    from reporting_common import edge_bucket, estimated_order_fee_usd, market_settlement, pnl_per_contract, price_bucket, spread_bucket
     from trade_journal import journal_path
 
     game_date = game_date or datetime.today().strftime("%Y-%m-%d")
@@ -614,8 +653,8 @@ def report(
         except Exception:
             by_ticker[t] = {}
 
-    def outcome_for(ticker: str) -> str:
-        return market_yes_no_result(by_ticker.get(ticker, {}))
+    def outcome_for(ticker: str) -> str | float:
+        return market_settlement(by_ticker.get(ticker, {}))
 
     total_cost = 0.0
     total_realized = 0.0
@@ -654,7 +693,6 @@ def report(
         price = fill_price if fill_price > 0 else float(r.get("limit_price", 0.0))
 
         cost = price * filled_contracts
-        total_cost += cost
         # Scale expected pnl to filled volume.
         total_expected += float(edge) * filled_contracts
 
@@ -663,12 +701,14 @@ def report(
         if pnlpc is None:
             unresolved += 1
             continue
+        # ROI denominator: resolved positions only (open ones have no P&L yet).
+        total_cost += cost
         pnl = pnlpc * filled_contracts
         total_realized += pnl
         total_fees += estimated_order_fee_usd(fill or r, price, filled_contracts)
         total_expected_resolved += float(edge) * filled_contracts
         resolved_n += 1
-        is_win = side == res
+        is_win = pnlpc > 0
         wins += 1 if is_win else 0
 
         p_bucket = f"{int(p_model*10)/10:.1f}-{int(p_model*10)/10 + 0.1:.1f}"
@@ -743,7 +783,7 @@ def report(
 
     console.print(f"Orders placed (successful): {len(placed)}")
     console.print(f"Orders filled (reconciled): {resolved_n + unresolved}")
-    console.print(f"Total cost (est)          : ${total_cost:,.2f}")
+    console.print(f"Resolved cost (est)       : ${total_cost:,.2f}")
     console.print(f"Expected P&L (model est)  : ${total_expected:,.2f}")
     if total_cost > 0 and (len(placed) - unresolved) > 0:
         roi = (total_realized / total_cost) * 100
@@ -770,7 +810,7 @@ def report(
         side = str(tr.get("side", "")).lower()
         entry = float(tr.get("price", 0.0))
         ctr = int(tr.get("contracts", 0) or 0)
-        for lbl in ("30m", "120m"):
+        for lbl in MARK_LABELS:
             mk = marks.get((oid, lbl))
             if not mk:
                 continue
@@ -793,7 +833,7 @@ def report(
                 float(marks[(tr["order_id"], lbl)].get("mark_yes_mid", 0.0) or 0.0) > 0
                 or float(marks[(tr["order_id"], lbl)].get("mark_no_mid", 0.0) or 0.0) > 0
             )
-            for lbl in ("30m", "120m")
+            for lbl in MARK_LABELS
         )
     )
     if total_fills > 0:
@@ -1023,6 +1063,7 @@ def report_range(
     start: str = typer.Option(None, "--start", help="Start date YYYY-MM-DD (inclusive). Default: earliest journal found."),
     end: str = typer.Option(None, "--end", help="End date YYYY-MM-DD (inclusive). Default: latest journal found."),
     per_day: bool = typer.Option(True, "--per-day/--no-per-day", help="Print a per-day summary table in addition to combined totals."),
+    paper: bool = typer.Option(False, "--paper", help="Report the dry-run paper journal (data/paper/) with fills simulated from marks."),
 ):
     """
     Aggregate trade performance across multiple days by scanning `data/trades_YYYY-MM-DD.jsonl` journals.
@@ -1038,9 +1079,9 @@ def report_range(
         parse_iso_date,
     )
     from kalshi_bridge import get_client
-    from reporting_common import edge_bucket, estimated_order_fee_usd, market_yes_no_result, pnl_per_contract, price_bucket, spread_bucket
+    from reporting_common import edge_bucket, estimated_order_fee_usd, market_settlement, pnl_per_contract, price_bucket, spread_bucket
 
-    journal_paths = journal_paths_sorted()
+    journal_paths = journal_paths_sorted(paper=paper)
     if not journal_paths:
         _warn(f"No trade journals found under {DATA_DIR}")
         raise typer.Exit(0)
@@ -1066,11 +1107,19 @@ def report_range(
         _warn("--end must be >= --start")
         raise typer.Exit(2)
 
-    window_paths = journal_paths_in_date_range(start_d, end_d)
+    window_paths = journal_paths_in_date_range(start_d, end_d, paper=paper)
     placed, fill_rows, mark_rows = load_window_rows(window_paths)
 
     window_label = f"{start_d.strftime('%Y-%m-%d')} → {end_d.strftime('%Y-%m-%d')}"
-    _header(f"Report (range) — {window_label}")
+    _header(f"Report (range){' — PAPER' if paper else ''} — {window_label}")
+    if paper:
+        from paper_trading import paper_fill_rows
+
+        fill_rows = paper_fill_rows(placed, mark_rows)
+        console.print(
+            "[dim]Paper fills: takers fill at once; resting orders only when a later pre-tip mark showed the "
+            "opposing quote at or through the limit.[/dim]"
+        )
 
     if not placed:
         _warn("No successful placed orders found in journals for this date range.")
@@ -1091,8 +1140,8 @@ def report_range(
         except Exception:
             by_ticker[t] = {}
 
-    def outcome_for(ticker: str) -> str:
-        return market_yes_no_result(by_ticker.get(ticker, {}))
+    def outcome_for(ticker: str) -> str | float:
+        return market_settlement(by_ticker.get(ticker, {}))
 
     total_cost = 0.0
     total_realized = 0.0
@@ -1132,11 +1181,9 @@ def report_range(
         price = fill_price if fill_price > 0 else float(r.get("limit_price", 0.0))
 
         cost = price * filled_contracts
-        total_cost += cost
         total_expected += float(edge) * filled_contracts
         by_day[day]["orders"] += 1
         by_day[day]["contracts"] += filled_contracts
-        by_day[day]["cost"] += cost
 
         res = outcome_for(ticker)
         pnlpc = pnl_per_contract(side, price, res)
@@ -1144,6 +1191,9 @@ def report_range(
             unresolved += 1
             by_day[day]["unresolved"] += 1
             continue
+        # ROI denominator: resolved positions only (open ones have no P&L yet).
+        total_cost += cost
+        by_day[day]["cost"] += cost
 
         pnl = pnlpc * filled_contracts
         total_realized += pnl
@@ -1151,7 +1201,7 @@ def report_range(
         total_expected_resolved += float(edge) * filled_contracts
         by_day[day]["pnl"] += pnl
         resolved_n += 1
-        is_win = side == res
+        is_win = pnlpc > 0
         wins += 1 if is_win else 0
 
         p_bucket = f"{int(p_model*10)/10:.1f}-{int(p_model*10)/10 + 0.1:.1f}"
@@ -1227,7 +1277,7 @@ def report_range(
 
     console.print(f"Orders placed (successful): {len(placed)}")
     console.print(f"Orders filled (reconciled): {resolved_n + unresolved}")
-    console.print(f"Total cost (est)          : ${total_cost:,.2f}")
+    console.print(f"Resolved cost (est)       : ${total_cost:,.2f}")
     console.print(f"Expected P&L (model est)  : ${total_expected:,.2f}")
     if total_cost > 0 and (len(placed) - unresolved) > 0:
         roi = (total_realized / total_cost) * 100
@@ -1253,7 +1303,7 @@ def report_range(
         side = str(tr.get("side", "")).lower()
         entry = float(tr.get("price", 0.0))
         ctr = int(tr.get("contracts", 0) or 0)
-        for lbl in ("30m", "120m"):
+        for lbl in MARK_LABELS:
             mk = marks.get((oid, lbl))
             if not mk:
                 continue
@@ -1554,7 +1604,7 @@ def calibrate(
     from kalshi_bridge import get_client
     from reporting_common import market_yes_no_result
 
-    journal_paths = journal_paths_sorted()
+    journal_paths = journal_paths_sorted(paper=paper)
     if not journal_paths:
         _warn(f"No trade journals found under {DATA_DIR}")
         raise typer.Exit(0)
@@ -1708,7 +1758,7 @@ def fit_blend(
     from market_blend import fit_blend_weight, save_blend_meta
     from reporting_common import market_yes_no_result
 
-    journal_paths = journal_paths_sorted()
+    journal_paths = journal_paths_sorted(paper=paper)
     if not journal_paths:
         _warn(f"No trade journals found under {DATA_DIR}")
         raise typer.Exit(0)
@@ -2063,6 +2113,11 @@ def model_vs_market(
         console.print(t)
 
     _print_slice("Overall (ΔLL < 0 ⇒ model beats market)", summary["overall"])
+    from model_vs_market import day_bootstrap_dll_ci
+
+    dll, lo, hi = day_bootstrap_dll_ci(rows)
+    verdict = "model better" if hi < 0 else ("market better" if lo > 0 else "not distinguishable from zero")
+    console.print(f"ΔLL {dll:+.4f} (paired day-bootstrap 95% CI {lo:+.4f} to {hi:+.4f}) — {verdict}")
     _print_slice("By Kalshi line", summary["line"])
     _print_slice("By |model − market| disagreement", summary["disagreement"])
     _print_slice("By date", summary["date"])
@@ -2172,31 +2227,59 @@ def backtest(
     end: str = typer.Option(..., "--end", help="End date YYYY-MM-DD."),
     bankroll: float = typer.Option(1000.0, "--bankroll"),
     pit_train: bool = typer.Option(True, "--pit-train/--no-pit-train", help="Point-in-time model retraining (weekly)."),
+    blend: str = typer.Option("walk_forward", "--blend", help="walk_forward (weights fit on earlier weeks only) or saved (models/blend_meta*.json, in-sample)."),
+    blend_since: str = typer.Option(None, "--blend-since", help="First day of full-slate scores used to fit walk-forward weights (default: a year before --start)."),
+    fill_model: str = typer.Option(None, "--fill-model", help="candles (fills need trades/quotes at the limit before tip) or none (everything fills). Default: BACKTEST_FILL_MODEL."),
+    zero_vacuum: bool = typer.Option(False, "--zero-vacuum", help="Zero teammate-absence features (bounds hindsight on late scratches)."),
 ):
-    """Replay the full scan stack over stored books (snapshots or Kalshi history) and settle vs actual rebounds."""
-    from backtest import run_backtest_range, BacktestReport
+    """Replay the full scan stack over stored pregame books and settle vs actual rebounds."""
+    from backtest import day_bootstrap_roi_ci, run_backtest_range
 
     _header(f"Backtest — {start} → {end}")
-    reports = run_backtest_range(start, end, bankroll=bankroll, pit_train=pit_train)
+    console.print(f"[dim]blend={blend} fill_model={fill_model or 'default'} zero_vacuum={zero_vacuum}[/dim]")
+    reports = run_backtest_range(
+        start, end, blend=blend, blend_since=blend_since,
+        bankroll=bankroll, pit_train=pit_train, fill_model=fill_model, zero_vacuum=zero_vacuum,
+    )
     if not reports:
-        _warn("No backtest results (missing snapshots for date range).")
+        _warn("No backtest results (no pregame books for the date range).")
         raise typer.Exit(0)
 
     total_cost = sum(r.total_cost for r in reports)
     total_pnl = sum(r.total_pnl for r in reports)
-    total_trades = sum(r.n_trades for r in reports)
+    total_signals = sum(r.n_trades for r in reports)
+    total_filled = sum(r.n_filled for r in reports)
     roi = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
 
     t = Table(title=f"Backtest Summary ({len(reports)} days)", box=box.SIMPLE_HEAD)
     t.add_column("Date", style="cyan")
-    t.add_column("Trades", justify="right")
+    t.add_column("Signals", justify="right")
+    t.add_column("Filled", justify="right")
     t.add_column("Cost $", justify="right")
     t.add_column("P&L $", justify="right")
     t.add_column("ROI%", justify="right")
+    t.add_column("CLV/ctr", justify="right")
     for r in sorted(reports, key=lambda x: x.game_date):
         day_roi = (r.total_pnl / r.total_cost * 100) if r.total_cost > 0 else 0.0
         color = "green" if r.total_pnl >= 0 else "red"
-        t.add_row(r.game_date, str(r.n_trades), f"{r.total_cost:.2f}", f"[{color}]{r.total_pnl:+.2f}[/{color}]", f"{day_roi:.1f}%")
+        clv = f"{r.mean_clv:+.3f}" if r.mean_clv is not None else "-"
+        t.add_row(r.game_date, str(r.n_trades), str(r.n_filled), f"{r.total_cost:.2f}",
+                  f"[{color}]{r.total_pnl:+.2f}[/{color}]", f"{day_roi:.1f}%", clv)
     console.print(t)
+
+    filled = [tr for r in reports for tr in r.trades if tr.filled > 0]
+    wins = sum(tr.won for tr in filled)
+    mean_p = sum(tr.p_model for tr in filled) / len(filled) if filled else 0.0
+    clv_ctr = sum(tr.filled for tr in filled if tr.clv is not None)
+    clv = (sum(tr.clv * tr.filled for tr in filled if tr.clv is not None) / clv_ctr) if clv_ctr else None
+    _, lo, hi = day_bootstrap_roi_ci([(r.total_pnl, r.total_cost) for r in reports])
     roi_color = "green" if total_pnl >= 0 else "red"
-    console.print(f"\nTotal: {total_trades} trades | Cost ${total_cost:.2f} | P&L [{roi_color}]{total_pnl:+.2f}[/{roi_color}] | ROI {roi:.1f}%")
+    console.print(
+        f"\nTotal: {total_signals} signals, {total_filled} filled "
+        f"({(total_filled / total_signals * 100) if total_signals else 0:.0f}%) | Cost ${total_cost:.2f} | "
+        f"P&L [{roi_color}]{total_pnl:+.2f}[/{roi_color}] | ROI {roi:.1f}% (day-bootstrap 95% CI {lo:+.1f}% to {hi:+.1f}%)"
+    )
+    if filled:
+        console.print(f"Win rate {wins}/{len(filled)} ({wins / len(filled):.1%}) vs mean model p {mean_p:.3f}")
+    if clv is not None:
+        console.print(f"Mean CLV vs last pregame mid: {clv:+.4f} per contract over {clv_ctr} contracts")

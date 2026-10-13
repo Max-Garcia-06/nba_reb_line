@@ -79,7 +79,7 @@ def test_reconcile_writes_fill_row(tmp_path, monkeypatch):
     assert fills[0]["avg_fill_price"] == pytest.approx(0.41)
 
 
-def test_reconcile_skips_existing_fill(tmp_path, monkeypatch):
+def test_reconcile_skips_terminal_fill(tmp_path, monkeypatch):
     game_date = "2026-05-20"
     rows = [
         _post_submit_row(),
@@ -88,6 +88,7 @@ def test_reconcile_skips_existing_fill(tmp_path, monkeypatch):
             "order_id": "ord-1",
             "filled_contracts": 8,
             "avg_fill_price": 0.41,
+            "order_status": "executed",
         },
     ]
     _write_journal(tmp_path, game_date, rows)

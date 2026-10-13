@@ -12,7 +12,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from journal_reader import (
-    existing_fill_order_ids,
+    index_fills_by_order_id,
     journal_paths_in_date_range,
     load_jsonl_rows,
     placed_with_order_id,
@@ -22,6 +22,9 @@ from trade_journal import TradeRow, append_row, journal_path
 log = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
+
+# Order states after which a fill row can no longer change.
+TERMINAL_STATUSES = frozenset({"executed", "filled", "canceled", "cancelled"})
 
 # A slate's late games settle after ET midnight, so the fill window has to run past
 # the calendar date it is journaled under.
@@ -42,6 +45,25 @@ class ReconcileResult:
             errors=self.errors + other.errors,
             days_processed=self.days_processed + other.days_processed,
         )
+
+
+def _is_terminal(fill_row: dict[str, Any]) -> bool:
+    status = str(fill_row.get("order_status", "") or "").lower()
+    if status:
+        return status in TERMINAL_STATUSES
+    # Rows written before order_status existed: success=True meant executed.
+    return fill_row.get("success") is True
+
+
+def _actual_fee_per_contract(order: dict[str, Any] | None, filled: int) -> float | None:
+    """Fees Kalshi actually charged on the order, per filled contract (None if not reported)."""
+    if not order or filled <= 0:
+        return None
+    keys = ("taker_fees_dollars", "maker_fees_dollars")
+    if not any(order.get(k) is not None for k in keys):
+        return None
+    total = sum(float(order.get(k) or 0.0) for k in keys)
+    return total / filled
 
 
 def _avg_fill_price_from_order(order: dict[str, Any], placed_row: dict[str, Any]) -> float:
@@ -104,9 +126,12 @@ def reconcile_fills_for_date(
     include_resting: bool = False,
 ) -> ReconcileResult:
     """
-    Write ``note=fill`` rows for journaled orders not yet reconciled on ``game_date``.
+    Write ``note=fill`` rows for journaled orders on ``game_date``.
 
-    Idempotent per ``order_id``. Returns zeros if journal missing or no placed orders.
+    An order is re-checked until its latest fill row is terminal (executed or
+    canceled); a new row is appended only when the filled count or status changed,
+    and readers take the latest row per order. Returns zeros if journal missing or
+    no placed orders.
     """
     path = journal_path(game_date)
     if not path.exists():
@@ -117,7 +142,7 @@ def reconcile_fills_for_date(
     if not placed:
         return ReconcileResult(updated=0, skipped=0, errors=0, days_processed=0)
 
-    existing_fill_ids = existing_fill_order_ids(rows)
+    latest_fill = index_fills_by_order_id(rows)
     updated = 0
     skipped = 0
     errors = 0
@@ -136,12 +161,14 @@ def reconcile_fills_for_date(
 
     for r in placed:
         order_id = str(r.get("order_id"))
-        if order_id in existing_fill_ids:
+        prev = latest_fill.get(order_id)
+        if prev is not None and _is_terminal(prev):
             skipped += 1
             continue
 
         side = str(r.get("side", ""))
         order_fills = fills_by_order.get(order_id, [])
+        o: dict[str, Any] | None = None
         try:
             o = client.get_order(order_id)
         except Exception as e:
@@ -173,6 +200,15 @@ def reconcile_fills_for_date(
 
         if filled <= 0 and not include_resting:
             continue
+        if (
+            prev is not None
+            and int(prev.get("filled_contracts", 0) or 0) == int(filled)
+            and str(prev.get("order_status", "") or "") == status
+        ):
+            skipped += 1
+            continue
+        actual_fee = _actual_fee_per_contract(o, int(filled))
+        fee_pc = actual_fee if actual_fee is not None else float(r.get("fee_per_contract", 0.0) or 0.0)
 
         append_row(
             game_date,
@@ -191,7 +227,7 @@ def reconcile_fills_for_date(
                 p_model_raw=float(r.get("p_model_raw", 0.0) or 0.0),
                 p_model_cal=float(r.get("p_model_cal", 0.0) or 0.0),
                 p_market=float(r.get("p_market", 0.0)),
-                fee_per_contract=float(r.get("fee_per_contract", 0.0) or 0.0),
+                fee_per_contract=float(fee_pc),
                 edge=float(r.get("edge", 0.0)),
                 ev=float(r.get("ev", 0.0)),
                 expected_pnl=float(r.get("expected_pnl", 0.0)),
@@ -200,6 +236,7 @@ def reconcile_fills_for_date(
                 book_spread=float(r.get("book_spread", 0.0)),
                 filled_contracts=int(filled),
                 avg_fill_price=avg_fill_price,
+                order_status=status,
                 note="fill",
                 success=True if status in {"executed", "filled"} else None,
             ).to_dict(),

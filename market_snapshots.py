@@ -232,6 +232,37 @@ def load_snapshots_within_hours_of_start(
     return list(by_ticker.values())
 
 
+def load_snapshots_before_tip(
+    game_date: str,
+    *,
+    lead_min: float,
+    earliest: bool = False,
+    schedule_index: dict | None = None,
+) -> list[MarketSnapshot]:
+    """
+    Per ticker, the latest (or ``earliest``) snapshot captured at least ``lead_min``
+    minutes before its game's tip. Snapshots for games with no known tip time are
+    dropped: anything captured after tip is an in-game price and leaks the outcome
+    into scoring, blend fits and backtests.
+    """
+    import data_engine as de
+
+    snaps = load_snapshots(game_date, latest_only=False)
+    if not snaps:
+        return []
+    idx = schedule_index if schedule_index is not None else de.slate_schedule_index(game_date)
+    by_ticker: dict[str, MarketSnapshot] = {}
+    for s in sorted(snaps, key=lambda x: x.captured_at, reverse=earliest):
+        row = idx.get(game_slug_from_ticker(s.ticker)) or {}
+        start = row.get("start_utc")
+        cap = _parse_captured_at_utc(s.captured_at)
+        if not isinstance(start, datetime) or cap is None:
+            continue
+        if cap <= start.astimezone(timezone.utc) - timedelta(minutes=float(lead_min)):
+            by_ticker[s.ticker] = s  # later iterations win: latest, or earliest when reversed
+    return list(by_ticker.values())
+
+
 def load_snapshots_open_and_close(game_date: str) -> tuple[list[MarketSnapshot], list[MarketSnapshot]]:
     """Return (earliest per ticker, latest per ticker) for CLV studies."""
     return (

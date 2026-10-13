@@ -74,10 +74,20 @@ class SegmentHealthReport:
 
 
 def _latest_mark_for_order(marks: dict[tuple[str, str], dict[str, Any]], order_id: str) -> dict[str, Any] | None:
+    """
+    CLV mark for an order: the pre-tip closing mark when present, else the latest
+    labelled mark. Unlabelled legacy marks are ignored — they were taken at
+    scan-relative times and can be in-game prices.
+    """
+    from journal_reader import CLOSE_MARK_LABEL
+
+    close = marks.get((order_id, CLOSE_MARK_LABEL))
+    if close is not None:
+        return close
     best: dict[str, Any] | None = None
     best_ts = ""
-    for (oid, _lbl), row in marks.items():
-        if oid != order_id:
+    for (oid, lbl), row in marks.items():
+        if oid != order_id or not lbl:
             continue
         ts = str(row.get("ts", "") or "")
         if best is None or ts >= best_ts:
@@ -240,10 +250,10 @@ def segment_health_for_range(
             except Exception:
                 markets[t] = {}
 
-    from reporting_common import market_yes_no_result
+    from reporting_common import market_settlement
 
-    def outcome_for(ticker: str) -> str:
-        return market_yes_no_result(markets.get(ticker, {}))
+    def outcome_for(ticker: str) -> str | float:
+        return market_settlement(markets.get(ticker, {}))
 
     segments = aggregate_segments(placed, fill_rows, mark_rows, outcome_for=outcome_for)
     return build_segment_health_report(segments)

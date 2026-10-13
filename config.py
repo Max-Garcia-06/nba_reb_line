@@ -220,7 +220,11 @@ USE_OOF_CALIBRATION = os.getenv("USE_OOF_CALIBRATION", "true").lower() in ("1", 
 BACKTEST_PIT_TRAIN = os.getenv("BACKTEST_PIT_TRAIN", "true").lower() in ("1", "true", "yes")
 BACKTEST_PIT_RETRAIN_DAYS = int(os.getenv("BACKTEST_PIT_RETRAIN_DAYS", "7"))
 BACKTEST_USE_EARLIEST_SNAPSHOT = os.getenv("BACKTEST_USE_EARLIEST_SNAPSHOT", "true").lower() in ("1", "true", "yes")
-BACKTEST_FILL_MODEL = os.getenv("BACKTEST_FILL_MODEL", "true").lower() in ("1", "true", "yes")
+# "candles": resting orders fill only when trades/quotes reached the limit before tip;
+# "none": every signal fills in full (optimistic bound). Legacy true/false map to these.
+BACKTEST_FILL_MODEL = {"true": "candles", "1": "candles", "yes": "candles", "false": "none", "0": "none", "no": "none"}.get(
+    os.getenv("BACKTEST_FILL_MODEL", "candles").lower(), os.getenv("BACKTEST_FILL_MODEL", "candles").lower()
+)
 
 # Feature materialization (gold layer in SQLite)
 MATERIALIZE_FEATURES_ON_ETL = os.getenv("MATERIALIZE_FEATURES_ON_ETL", "true").lower() in ("1", "true", "yes")
