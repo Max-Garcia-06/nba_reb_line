@@ -226,6 +226,8 @@ def reconcile_fills_for_date(
                 p_model=float(r.get("p_model", 0.0)),
                 p_model_raw=float(r.get("p_model_raw", 0.0) or 0.0),
                 p_model_cal=float(r.get("p_model_cal", 0.0) or 0.0),
+                model_trained_on=str(r.get("model_trained_on", "") or ""),
+                games_played=int(r.get("games_played", 0) or 0),
                 p_market=float(r.get("p_market", 0.0)),
                 fee_per_contract=float(fee_pc),
                 edge=float(r.get("edge", 0.0)),

@@ -30,6 +30,6 @@ def test_fit_segmented_global_and_segment():
     bundle = fit_segmented(rows, min_global=50, min_segment=30)
     assert bundle is not None
     assert bundle.global_cal is not None
-    assert segment_key(line=1.5, side="yes", games_played=60) in bundle.segments
-    out = bundle.transform(0.55, line=1.5, side="yes", games_played=60)
+    assert segment_key(line=1.5, games_played=60) in bundle.segments
+    out = bundle.transform(0.55, line=1.5, games_played=60)
     assert 0.0 < out < 1.0

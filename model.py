@@ -91,7 +91,8 @@ def train(save: bool = True, family: str = MODEL_FAMILY, df: Optional[pd.DataFra
             pickle.dump(meta, f)
         log.info(f"Saved {MODEL_PATH.name} (trained_on={meta['trained_on']})")
         if fit_oof:
-            fit_and_save_oof_calibrator(dff, family=family, model_trained_on=meta["trained_on"])
+            meta["oof_calibrator_fit"] = fit_and_save_oof_calibrator(
+                dff, family=family, model_trained_on=meta["trained_on"])
     return m, meta
 
 

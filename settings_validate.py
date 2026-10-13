@@ -40,6 +40,7 @@ def validate_settings() -> SettingsValidation:
             SEGMENT_MIN_AVG_CLV,
             SEGMENT_MIN_ROI_PCT,
             CALIBRATE_MAX_AGE_DAYS,
+            BLEND_CAP,
             DAILY_LOSS_LIMIT_PCT,
             DEFAULT_BLEND_WEIGHT,
             KALSHI_BASE_URL,
@@ -96,6 +97,8 @@ def validate_settings() -> SettingsValidation:
     ):
         if not (0.0 <= v <= 1.0):
             errors.append(f"{name} must be in [0,1], got {v}")
+    if not (BLEND_CAP > 0):
+        errors.append(f"BLEND_CAP must be > 0 (logits), got {BLEND_CAP}")
     if not (0 < MAX_BID_ASK_SPREAD < 1):
         errors.append(f"MAX_BID_ASK_SPREAD must be in (0,1), got {MAX_BID_ASK_SPREAD}")
     if not (0 < MIN_LIMIT_PRICE < 1):

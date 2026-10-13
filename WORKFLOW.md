@@ -16,7 +16,7 @@ nba_api ──etl──► SQLite: player_gamelogs, tracking_rebounds, schedule
                     │                                          + model_meta.pkl (trained_on)
                     │                                          + p_calibrator_oof.pkl
 Kalshi ◄──scan──────┘  slate.py: markets → (player, team, opp, game) → PIT features
-   │                   → PMF → P(REB > k) → calibrate → blend w/ market (per bucket)
+   │                   → PMF → P(REB > k) → calibrate → capped blend w/ market
    │                   → fee-adjusted edge vs maker/taker limit → Kelly → risk gates
    ├──► data/trades_YYYY-MM-DD.jsonl  (journal)   ──► reconcile ──► report / report-range
    ├──► data/paper/trades_*.jsonl     (dry-run)   ──► report-range --paper
@@ -33,7 +33,7 @@ Kalshi ◄──scan──────┘  slate.py: markets → (player, team, 
 | Markets | `snapshot`, `schedule-snapshots` | `data/snapshots/` |
 | Trade | `scan [--live]`, `mark`, `reconcile` | journal, execution ledger |
 | Review | `report`, `report-range`, `calibrate`, `segment-report` | P&L net of fees, calibrators, go/no-go |
-| Blend | `refit-blend`, `fit-blend-segments`, `model-vs-market` | `models/blend_meta*.json` |
+| Blend | `refit-blend` (capped blend, Sundays), `model-vs-market` | `models/blend_meta.json` |
 
 ## 2. Setup
 

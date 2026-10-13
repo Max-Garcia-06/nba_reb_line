@@ -65,3 +65,9 @@ def test_cli_callback_exits_on_invalid_settings(monkeypatch):
     monkeypatch.setattr("config.MAX_BET_PCT", 2.0)
     with pytest.raises(typer.Exit):
         validate_settings_callback()
+
+
+def test_validate_rejects_non_positive_blend_cap(monkeypatch):
+    monkeypatch.setattr("config.BLEND_CAP", 0.0)
+    v = validate_settings()
+    assert not v.ok and any("BLEND_CAP" in e for e in v.errors)

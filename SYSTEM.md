@@ -29,7 +29,7 @@ because of incidents documented there.
 | `slate.py`, `identity_bridge.py`, `injury_feed.py` | tonight's markets → player/game → PIT features |
 | `probability_engine.py` | PMF → P(over)/P(under), coherent |
 | `calibration.py`, `calibrate_preflight.py` | OOF + fill isotonic/Platt calibrators, staleness and model-mismatch gates |
-| `market_blend.py` | per-disagreement-bucket logit shrinkage toward the market mid |
+| `market_blend.py` | capped logit shrinkage toward the market mid (one monotone curve) |
 | `fees.py`, `execution_engine.py`, `edge_detector.py` | fee-aware edge vs maker/taker limit, Kelly sizing, gates |
 | `risk_manager.py`, `journal_risk.py` | daily caps, kill switch |
 | `trade_journal.py`, `reconcile_fills.py` | JSONL journal; fills are authoritative |
@@ -128,12 +128,33 @@ disagreement bucket the model is at or slightly ahead of the book below 0.15
 and badly behind at ≥0.15 (ΔLL +0.057, n=539) — the same winner's-curse
 signature MLB found. Per-bucket blend weights exist for exactly this.
 
-**Blend weights** (`refit-blend`, PIT weekly models + PIT calibrators):
+**Blend weights, 2026-10-08 (superseded).** Per-bucket weights (Nov–Jun: global 0.40;
+<0.05 0.73, 0.05–0.10 0.46, 0.10–0.15 0.44, ≥0.15 0.14) were non-monotone in p_model
+and a weekly 30-day refit dropped any bucket under 100 rows back to the global weight
+(≥0.15 had ~80 rows a month, so it reverted to ~0.40 most Sundays).
 
-| Window | global | <0.05 | 0.05–0.10 | 0.10–0.15 | ≥0.15 |
-|---|---|---|---|---|---|
-| Nov–Mar (fit for holdout test) | 0.33 | 0.67 | 0.37 | 0.33 | 0.09 |
-| Nov–Jun (production, 2026-10-08) | 0.40 | 0.73 | 0.46 | 0.44 | 0.14 |
+**Calibration and blend, re-tested 2026-10-13** (all 16,137 2025-26 full-slate PIT
+scores, `models/` untouched by the test):
+
+* *OOF isotonic calibrator* — forward log-loss vs raw probabilities, month by month:
+  worse in 6 of 8 months, overall 0.53014 vs 0.52942. `USE_OOF_CALIBRATION` is now off;
+  PIT scoring, refits and backtests follow the same setting.
+* *Blend*, weekly walk-forward Jan–Jun 2026 (expanding window, raw input, n=14,365):
+
+| Blend | all markets | ≥0.15 disagreement (n=486) |
+|---|---|---|
+| market only | 0.52776 | 0.63405 |
+| plain logit blend | 0.52609 | 0.65146 |
+| 4 buckets (old production) | 0.52612 | 0.64008 |
+| **capped, cap 0.3, w fit** (new) | **0.52584** | 0.63702 |
+| capped, cap 0.2, w fit | 0.52600 | 0.63527 |
+
+  Every blend beats the market overall by ~0.0019, but only a cap keeps the model
+  from losing badly where it disagrees most — which is where trades come from. A cap
+  fit jointly with w drifts to "no cap" (overall log-loss barely weights the tail),
+  so `BLEND_CAP` is a fixed risk setting and only w is refit weekly, over a season-long
+  window. Both cap values were picked on this same season: in-sample, and the model
+  still loses to the market at ≥0.15 under any blend.
 
 **Out-of-sample stack backtest, superseded.** The 2026-10-08 figure (82 trades,
 ROI +24.6%, CI +7% to +41%) used blend weights swapped in by hand, a spread-based fill
@@ -149,6 +170,11 @@ maker limits, Kelly, live gates incl. bid > 0 and spread ≤ 0.08):
 | Fills from trades/quotes before tip (default) | 178 | 100 (56%) | +16.5% | −6.6% to +37.9% | −0.0026 |
 | Everything fills (upper bound) | 178 | 178 | +17.1% | +1.1% to +33.6% | +0.0054 |
 | Teammate-absence features zeroed | 27 | 9 | −23.4% | −71% to +15% | −0.0062 |
+| **Tier 3 stack** (raw probs, capped blend cap 0.3; fills from trades) | 106 | 68 (64%) | +19.1% | −11.8% to +51.2% | −0.0003 |
+
+The Tier 3 row (2026-10-13) trades less and its fills are calibrated (win rate 51.5% vs
+mean model p 0.503, against 54% vs 0.565 before) with CLV ≈ 0 instead of negative;
+the CI still spans zero.
 
 Full-slate model vs market (Nov 18 2025 – Jun 13 2026, 16,137 markets, PIT):
 ΔLL +0.0021 (model slightly worse), paired day-bootstrap CI −0.0014 to +0.0056 —
@@ -171,9 +197,10 @@ Reading:
 
 ## 6. Trading stack (ported from MLB, see MLB SYSTEM.md §3)
 
-Probability plumbing per market: PMF → raw P(over) → calibrate (Platt if
-enabled → fill-segmented isotonic → OOF isotonic; support-clamped, ±0.12 cap)
-→ blend toward the side's market mid with the per-disagreement-bucket weight
+Probability plumbing per market: PMF → raw P(over) → calibrate in P(over) space
+(Platt if enabled → fill-segmented isotonic of the current model → OOF isotonic if
+enabled → raw; support-clamped, ±0.12 cap) → capped blend toward the side's market
+mid (logit offset ≤ `BLEND_CAP`)
 → maker-aware limit → `edge = p_blend − limit − fee` → gates (min p, tail
 threshold, spread, realistic ask, blocked segments, VPIN) → fractional Kelly
 on net-of-fee odds → portfolio caps → risk desk.

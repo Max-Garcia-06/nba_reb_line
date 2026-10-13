@@ -40,7 +40,7 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 
 import data_engine as de
-from config import DB_PATH, MODEL_DIR, MODEL_FAMILY
+from config import DB_PATH, MODEL_DIR, MODEL_FAMILY, USE_OOF_CALIBRATION
 from edge_detector import fill_calibrated_probabilities
 from feature_store import build_feature_table
 from identity_bridge import PlayerIndex
@@ -196,11 +196,16 @@ def _pit_calibrator(game_date: str):
 
 
 def calibrate_results(prs: list, game_date: str, pit_train: bool) -> None:
-    """PIT calibrator for historical scoring; the live calibrator stack otherwise."""
+    """
+    PIT stand-in for the live OOF calibrator for historical scoring; the live
+    calibrator stack otherwise. With USE_OOF_CALIBRATION off, live prices raw
+    probabilities (until a fill calibrator exists), so PIT scoring does too —
+    blend weights must be fit on the probabilities live will blend.
+    """
     if not pit_train:
         fill_calibrated_probabilities(prs)
         return
-    cal = _pit_calibrator(game_date)
+    cal = _pit_calibrator(game_date) if USE_OOF_CALIBRATION else None
     for pr in prs:
         pr.p_over_calibrated = float(cal.transform(pr.p_over)) if cal is not None else float(pr.p_over)
         pr.p_under_calibrated = 1.0 - pr.p_over_calibrated

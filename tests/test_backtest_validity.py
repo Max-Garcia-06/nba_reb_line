@@ -5,7 +5,7 @@ import pytest
 import backtest
 import market_blend
 from backtest import Candle, day_bootstrap_roi_ci, simulate_fill
-from market_blend import fit_blend_weights, load_blend_weight, pinned_blend_weights
+from market_blend import BlendParams
 
 DEC, TIP = 1_000, 10_000
 
@@ -48,37 +48,6 @@ def test_candles_after_tip_or_before_decision_are_ignored():
     assert simulate_fill("yes", 0.41, 10, is_taker=False, later=later, decision_ts=DEC, tip_ts=TIP) == 0
 
 
-# ---------- blend weights ----------
-
-def _rows(n, p, m, y):
-    return [{"p": p, "m": m, "y": y} for _ in range(n)]
-
-
-def test_fit_blend_weights_uses_default_below_minimum(monkeypatch):
-    monkeypatch.setattr(market_blend, "MIN_BLEND_ROWS", 200)
-    g, segs = fit_blend_weights(_rows(10, 0.6, 0.5, 1.0))
-    assert g == market_blend.DEFAULT_BLEND_WEIGHT and segs == {}
-
-
-def test_fit_blend_weights_floors_and_segments(monkeypatch):
-    monkeypatch.setattr(market_blend, "MIN_BLEND_ROWS", 10)
-    monkeypatch.setattr(market_blend, "MIN_BLEND_ROWS_SEGMENT", 10)
-    # Model says 0.70, market 0.50, outcome rate 0.50 -> fitted w ~ 0, floored.
-    rows = _rows(50, 0.70, 0.50, 1.0) + _rows(50, 0.70, 0.50, 0.0)
-    g, segs = fit_blend_weights(rows)
-    assert g == market_blend.MIN_BLEND_WEIGHT
-    assert set(segs) == {">=0.15"} and segs[">=0.15"] == market_blend.MIN_BLEND_WEIGHT
-
-
-def test_pinned_blend_weights_scoped(monkeypatch):
-    monkeypatch.setattr(market_blend, "USE_MARKET_BLEND", True)
-    monkeypatch.setattr(market_blend, "BLEND_WEIGHT_OVERRIDE", None)
-    with pinned_blend_weights(0.25, {"<0.05": 0.8}):
-        assert load_blend_weight(0.50, 0.51) == 0.8
-        assert load_blend_weight(0.70, 0.50) == 0.25
-    assert market_blend._CACHED_WEIGHT is None and market_blend._CACHED_SEGMENT_WEIGHTS is None
-
-
 # ---------- walk-forward ----------
 
 def test_walk_forward_blend_fits_only_on_earlier_weeks(monkeypatch):
@@ -92,7 +61,8 @@ def test_walk_forward_blend_fits_only_on_earlier_weeks(monkeypatch):
 
     fits = []
     monkeypatch.setattr("model_vs_market.evaluate_day", fake_eval)
-    monkeypatch.setattr(backtest, "fit_blend_weights", lambda rows: fits.append(sorted({r["date"] for r in rows})) or (0.3, {}))
+    monkeypatch.setattr(backtest, "fit_capped_blend",
+                        lambda rows: fits.append(sorted({r["date"] for r in rows})) or (BlendParams(0.3, 0.2), {}))
     monkeypatch.setattr(backtest, "run_backtest_day", lambda d, **kw: None)
     backtest.run_backtest_range("2026-04-06", "2026-04-14", blend="walk_forward", blend_since="2026-03-30")
     # Two weeks (Mon 04-06, Mon 04-13); each fit sees only days before its Monday.

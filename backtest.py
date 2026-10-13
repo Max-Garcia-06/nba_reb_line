@@ -45,7 +45,8 @@ from sqlalchemy import create_engine, text
 from config import BACKTEST_FILL_MODEL, EDGE_THRESHOLD, MIN_P, TAIL_EDGE_MULT, TAIL_P_CUTOFF
 from edge_detector import apply_flow_guard, scan_for_edges
 from kalshi_bridge import MarketLine
-from market_blend import fit_blend_weights, pinned_blend_weights
+from config import DEFAULT_BLEND_WEIGHT
+from market_blend import BlendParams, fit_capped_blend, pinned_blend
 from probability_engine import calculate_probabilities
 from trading_stack import finalize_signals
 
@@ -340,8 +341,8 @@ def run_backtest_range(
     """
     Backtest each day in ``[start, end]``.
 
-    ``blend="walk_forward"``: every week trades on blend weights fit (see
-    :func:`market_blend.fit_blend_weights`) on full-slate PIT scores from
+    ``blend="walk_forward"``: every week trades on a capped blend fit (see
+    :func:`market_blend.fit_capped_blend`) on full-slate PIT scores from
     ``blend_since`` (default: a year before ``start``) up to the day before that
     week's Monday. ``blend="saved"`` uses models/blend_meta*.json as live does.
     """
@@ -356,7 +357,7 @@ def run_backtest_range(
     scored: list[dict] = []
     scored_until = pd.Timestamp(since)
     reports: list[BacktestReport] = []
-    weights: dict[str, tuple[float, dict[str, float]]] = {}
+    weights: dict[str, BlendParams] = {}
     for d in dates:
         week = mvm._week_start(d)
         if week not in weights:
@@ -366,10 +367,11 @@ def run_backtest_range(
                               for r in mvm.evaluate_day(ds, **eval_kw))
                 scored_until += timedelta(days=1)
             prior = [r for r in scored if r["date"] < week]
-            weights[week] = fit_blend_weights(prior)
-            log.info("Walk-forward blend for week %s: %d rows, w=%.2f, segments=%s",
-                     week, len(prior), weights[week][0], weights[week][1])
-        with pinned_blend_weights(*weights[week]):
+            fit = fit_capped_blend(prior)
+            weights[week] = fit[0] if fit else BlendParams(w=float(DEFAULT_BLEND_WEIGHT))
+            log.info("Walk-forward blend for week %s: %d rows, w=%.2f cap=%s",
+                     week, len(prior), weights[week].w, weights[week].cap)
+        with pinned_blend(weights[week]):
             rep = run_backtest_day(d, **kwargs)
         if rep is not None:
             reports.append(rep)

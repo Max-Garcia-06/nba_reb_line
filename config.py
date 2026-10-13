@@ -42,6 +42,9 @@ DEFAULT_BLEND_WEIGHT = float(os.getenv("DEFAULT_BLEND_WEIGHT", "0.35"))
 # the model has never earned.
 MIN_BLEND_WEIGHT = float(os.getenv("MIN_BLEND_WEIGHT", "0.05"))
 MIN_BLEND_ROWS = int(os.getenv("MIN_BLEND_ROWS", "200"))
+# Capped blend: max logit distance the model may pull the price from the market mid.
+# 0.3 chosen on the 2025-26 walk-forward (SYSTEM.md §5); a risk setting, not fit weekly.
+BLEND_CAP = float(os.getenv("BLEND_CAP", "0.3"))
 BLEND_META_PATH = MODEL_DIR / "blend_meta.json"
 
 # Segment-level blend weights (by |model-market| disagreement bucket; see
@@ -57,7 +60,8 @@ SEGMENT_BLEND_META_PATH = MODEL_DIR / "blend_meta_segments.json"
 # actual recent performance vs. the market instead of staying pinned wherever it was
 # last set by hand. LAG_DAYS skips the most recent days, whose boxscores/ETL may not
 # be finalized yet.
-BLEND_REFIT_LOOKBACK_DAYS = int(os.getenv("BLEND_REFIT_LOOKBACK_DAYS", "30"))
+# A season: a 30-day window let thin months swing the weights (and dropped buckets).
+BLEND_REFIT_LOOKBACK_DAYS = int(os.getenv("BLEND_REFIT_LOOKBACK_DAYS", "365"))
 BLEND_REFIT_LAG_DAYS = int(os.getenv("BLEND_REFIT_LAG_DAYS", "2"))
 
 # Kalshi trading fees: taker fee = ceil(rate * C * P * (1-P)) cents; resting (maker) orders free.
@@ -190,6 +194,8 @@ REQUIRE_FILL_CALIB_FOR_LIVE = os.getenv("REQUIRE_FILL_CALIB_FOR_LIVE", "true").l
 # Live scans refuse once the model's newest training game is this many days behind
 # the newest game in the DB (0 = off). Measured against the data, not the clock, so
 # the offseason never counts. Nightly retrains on Sundays keep this under ~8 days.
+# Live refuses blend weights whose newest scored slate is older than this (0 = off).
+BLEND_MAX_AGE_DAYS = int(os.getenv("BLEND_MAX_AGE_DAYS", "21"))
 MODEL_MAX_DATA_LAG_DAYS = int(os.getenv("MODEL_MAX_DATA_LAG_DAYS", "14"))
 
 # Live risk desk
@@ -214,7 +220,9 @@ AUTO_KILL_ON_RISK_BREACH = os.getenv("AUTO_KILL_ON_RISK_BREACH", "true").lower()
 KILL_SWITCH_PATH = Path(os.getenv("KILL_SWITCH_PATH", str(DATA_DIR / "KILL_SWITCH")))
 
 # OOF isotonic calibration (fit from walk-forward CV; separate from fill-based calibrator)
-USE_OOF_CALIBRATION = os.getenv("USE_OOF_CALIBRATION", "true").lower() in ("1", "true", "yes")
+# Off by default: the OOF isotonic calibrator lost to raw probabilities going forward in
+# 6 of 8 months of 2025-26 (overall log-loss 0.53014 vs 0.52942; SYSTEM.md §5).
+USE_OOF_CALIBRATION = os.getenv("USE_OOF_CALIBRATION", "false").lower() in ("1", "true", "yes")
 
 # Backtest
 BACKTEST_PIT_TRAIN = os.getenv("BACKTEST_PIT_TRAIN", "true").lower() in ("1", "true", "yes")

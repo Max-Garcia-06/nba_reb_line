@@ -47,7 +47,6 @@ from trade_journal import TradeRow, append_row
 from calibration import (
     PlattCalibrator,
     SegmentedCalibratorBundle,
-    load as load_calibrator,
     load_oof,
     load_platt,
     load_segmented,
@@ -56,7 +55,6 @@ from identity_bridge import norm_player_name
 
 log = logging.getLogger(__name__)
 
-_CALIBRATOR = None
 _OOF_CALIBRATOR = None
 _SEGMENTED: SegmentedCalibratorBundle | None | bool = None
 _PLATT: PlattCalibrator | None | bool = None
@@ -64,8 +62,7 @@ _PLATT: PlattCalibrator | None | bool = None
 
 def reset_calibration_cache() -> None:
     """Clear the lazy isotonic calibrator cache (for tests / reload)."""
-    global _CALIBRATOR, _OOF_CALIBRATOR, _SEGMENTED, _PLATT
-    _CALIBRATOR = None
+    global _OOF_CALIBRATOR, _SEGMENTED, _PLATT
     _OOF_CALIBRATOR = None
     _SEGMENTED = None
     _PLATT = None
@@ -113,8 +110,8 @@ def _get_segmented() -> SegmentedCalibratorBundle | None:
     return _SEGMENTED
 
 
-def _calibrate(p: float, *, line: float = 1.5, side: str = "yes", games_played: int = 0) -> float:
-    global _CALIBRATOR
+def _calibrate(p: float, *, line: float = 1.5, games_played: int = 0) -> float:
+    """Calibrate P(over): Platt if enabled → fill-segmented → OOF → raw. Each is preflight-checked."""
     if not USE_ISOTONIC_CALIBRATION:
         return float(p)
     # Live fill-based calibration is checked before OOF: OOF is fit on all
@@ -130,7 +127,7 @@ def _calibrate(p: float, *, line: float = 1.5, side: str = "yes", games_played: 
     seg = _get_segmented()
     if seg is not None:
         try:
-            return float(seg.transform(float(p), line=line, side=side, games_played=games_played))
+            return float(seg.transform(float(p), line=line, games_played=games_played))
         except Exception:
             pass
     oof = _get_oof_calibrator()
@@ -139,17 +136,7 @@ def _calibrate(p: float, *, line: float = 1.5, side: str = "yes", games_played: 
             return float(oof.transform(float(p)))
         except Exception:
             pass
-    if _CALIBRATOR is None:
-        try:
-            _CALIBRATOR = load_calibrator()
-        except Exception:
-            _CALIBRATOR = False  # sentinel: don't try again
-    if not _CALIBRATOR:
-        return float(p)
-    try:
-        return float(_CALIBRATOR.transform(float(p)))
-    except Exception:
-        return float(p)
+    return float(p)
 
 
 def calibrate_over_under(
@@ -163,7 +150,7 @@ def calibrate_over_under(
     """
     p = float(p_over_raw)
     p = min(1.0 - 1e-6, max(1e-6, p))
-    p_over_c = float(_calibrate(p, line=line, side="yes", games_played=games_played))
+    p_over_c = float(_calibrate(p, line=line, games_played=games_played))
     p_over_c = min(1.0 - 1e-6, max(1e-6, p_over_c))
     return p_over_c, 1.0 - p_over_c
 
@@ -529,12 +516,14 @@ def execute_signals(
     The kill switch is re-checked before every order. A same-side resting order
     at (about) the same price is left alone rather than duplicated.
     """
+    from model import get_model_trained_on
     from risk_manager import kill_switch_active
 
     if isinstance(client, MockKalshiClient):
         raise RuntimeError("Refusing to place live orders through the mock Kalshi client (credentials missing).")
     ledger = ExecutionLedger()
     results: list[OrderResult] = []
+    model_stamp = str(get_model_trained_on() or "")
 
     for sig in signals:
         if kill_switch_active():
@@ -595,6 +584,7 @@ def execute_signals(
                 book_bid=book_bid,
                 book_ask=book_ask,
                 book_spread=book_spread,
+                model_trained_on=model_stamp,
                 note="pre-submit",
                 success=None,
             ).to_dict(),
@@ -651,6 +641,7 @@ def execute_signals(
                 book_bid=book_bid,
                 book_ask=book_ask,
                 book_spread=book_spread,
+                model_trained_on=model_stamp,
                 note="post-submit",
                 success=None if result.ambiguous else result.success,
             ).to_dict(),

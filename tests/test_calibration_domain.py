@@ -54,6 +54,6 @@ def test_segmented_bundle_does_not_extrapolate_out_of_support():
     ]
     bundle = fit_segmented(rows, min_global=50, min_segment=30)
     assert bundle is not None
-    assert segment_key(line=2.5, side="yes", games_played=10) in bundle.segments
+    assert segment_key(line=2.5, games_played=10) in bundle.segments
     # 0.90 is far above the largest p this segment ever saw (0.50).
-    assert bundle.transform(0.90, line=2.5, side="yes", games_played=10) == 0.90
+    assert bundle.transform(0.90, line=2.5, games_played=10) == 0.90

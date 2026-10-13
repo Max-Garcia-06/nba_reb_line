@@ -22,6 +22,9 @@ from trade_journal import TradeRow, append_row, journal_path
 
 def record_paper_orders(game_date: str, signals: list) -> int:
     """Journal signals as paper orders; one per (ticker, side) per day, like the live ledger."""
+    from model import get_model_trained_on
+
+    model_stamp = str(get_model_trained_on() or "")
     seen = {(r.get("ticker"), r.get("side")) for r in placed_with_order_id(load_jsonl_rows(journal_path(game_date, paper=True)))}
     n = 0
     for s in signals:
@@ -52,6 +55,7 @@ def record_paper_orders(game_date: str, signals: list) -> int:
                 book_bid=float(s.book_bid),
                 book_ask=float(s.book_ask),
                 book_spread=float(s.book_spread),
+                model_trained_on=model_stamp,
                 note="post-submit",
                 success=True,
             ).to_dict(),

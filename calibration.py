@@ -146,13 +146,50 @@ def games_played_bucket(n: int) -> str:
     return "gp50plus" if int(n) >= 50 else "gp_lt50"
 
 
-def segment_key(*, line: float, side: str, games_played: int) -> str:
-    return f"{line_bucket(line)}|{str(side).lower()}|{games_played_bucket(games_played)}"
+def segment_key(*, line: float, games_played: int) -> str:
+    """Fill calibrators live in P(over) space, so segments are keyed by line and history only."""
+    return f"{line_bucket(line)}|{games_played_bucket(games_played)}"
+
+
+def fill_calibration_rows(
+    fill_rows: list[dict],
+    *,
+    outcome_for,
+    model_trained_on: str | None,
+) -> list[dict]:
+    """
+    Fit rows in P(over) space from reconciled fills of the current model.
+
+    A NO fill carries P(under) and "under won"; it becomes P(over) = 1 − p and
+    y = 1 − y, so YES and NO fills calibrate one curve that is applied to P(over).
+    Fills journaled by a different (or unrecorded) model are dropped: a calibrator
+    must describe the model it will correct.
+    """
+    out: list[dict] = []
+    for r in fill_rows:
+        filled = int(r.get("filled_contracts", 0) or 0)
+        if filled <= 0 or not model_trained_on or str(r.get("model_trained_on") or "") != str(model_trained_on):
+            continue
+        res = outcome_for(str(r.get("ticker", "")))
+        if res not in {"yes", "no"}:
+            continue
+        side = str(r.get("side", "")).lower()
+        raw = r.get("p_model_raw")
+        p_side = float(raw) if raw is not None else float(r.get("p_model", 0.0))
+        p_over = p_side if side == "yes" else 1.0 - p_side
+        out.append({
+            "p": p_over,
+            "y": 1.0 if res == "yes" else 0.0,
+            "weight": float(filled),
+            "line": float(r.get("kalshi_line", r.get("line", 1.5)) or 1.5),
+            "games_played": int(r.get("games_played", 0) or 0),
+        })
+    return out
 
 
 @dataclass
 class SegmentedCalibratorBundle:
-    """Per (line, side, games_played) isotonic maps with global fallback."""
+    """Per (line, games_played) isotonic maps of P(over), with global fallback."""
 
     global_cal: ProbabilityCalibrator | None
     segments: dict[str, ProbabilityCalibrator] = field(default_factory=dict)
@@ -165,10 +202,9 @@ class SegmentedCalibratorBundle:
         p: float,
         *,
         line: float,
-        side: str,
         games_played: int = 0,
     ) -> float:
-        key = segment_key(line=line, side=side, games_played=games_played)
+        key = segment_key(line=line, games_played=games_played)
         seg = self.segments.get(key)
         if seg is not None and self.segment_counts.get(key, 0) >= self.min_segment_rows:
             return seg.transform(p)
@@ -185,7 +221,7 @@ def fit_segmented(
     model_trained_on: str | None = None,
 ) -> SegmentedCalibratorBundle | None:
     """
-    rows: dicts with keys p, y, line, side, games_played, weight (optional)
+    rows: dicts with keys p (P over), y (over won), line, games_played, weight (optional)
     """
     if len(rows) < min_global:
         return None
@@ -206,7 +242,7 @@ def fit_segmented(
     counts: dict[str, int] = {}
     buckets: dict[str, list[dict]] = {}
     for r in rows:
-        k = segment_key(line=float(r["line"]), side=str(r["side"]), games_played=int(r.get("games_played", 0)))
+        k = segment_key(line=float(r["line"]), games_played=int(r.get("games_played", 0)))
         buckets.setdefault(k, []).append(r)
         counts[k] = counts.get(k, 0) + 1
     for k, sub in buckets.items():
@@ -226,8 +262,6 @@ def save_segmented(bundle: SegmentedCalibratorBundle, path: Path = SEGMENTED_CAL
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
         pickle.dump(bundle, f)
-    if bundle.global_cal is not None:
-        save(bundle.global_cal, CALIB_PATH)
 
 
 def save_oof(cal: ProbabilityCalibrator, path: Path = OOF_CALIB_PATH) -> None:
@@ -258,10 +292,7 @@ def fit_oof_from_rows(
 
 def load_segmented(path: Path = SEGMENTED_CALIB_PATH) -> SegmentedCalibratorBundle | None:
     if not path.exists():
-        g = load(CALIB_PATH)
-        if g is None:
-            return None
-        return SegmentedCalibratorBundle(global_cal=g, segments={})
+        return None
     with open(path, "rb") as f:
         obj = pickle.load(f)
     if isinstance(obj, SegmentedCalibratorBundle):

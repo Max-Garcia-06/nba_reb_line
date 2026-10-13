@@ -44,6 +44,7 @@ class TradeRow:
     p_model: float = 0.0
     p_model_raw: float = 0.0
     p_model_cal: float = 0.0  # calibrated pre-blend side prob (fit-blend input)
+    model_trained_on: str = ""  # stamp of the model that priced this order
     p_market: float = 0.0
     fee_per_contract: float = 0.0  # expected Kalshi fee at the limit price
     edge: float = 0.0
