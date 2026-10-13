@@ -28,6 +28,7 @@ def validate_settings_callback() -> None:
         raise typer.Exit(1)
 
 app.command()(cmd.etl)
+app.command("injury-backfill")(cmd.injury_backfill)
 app.command()(cmd.train)
 app.command()(cmd.evaluate)
 app.command()(cmd.scan)

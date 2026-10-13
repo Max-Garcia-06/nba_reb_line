@@ -171,11 +171,21 @@ def current_team_by_player(game_date: str) -> dict[int, int]:
 # 4. Persist to SQLite (dedupe on natural key)
 # ---------------------------------------------------------------------------
 
-def _replace_seasons(df: pd.DataFrame, table: str, key: list[str], seasons: list[str], engine) -> None:
+class ETLShrinkError(RuntimeError):
+    """A re-pull returned fewer rows than stored for a season (API hiccup, not real data)."""
+
+
+def _replace_seasons(
+    df: pd.DataFrame, table: str, key: list[str], seasons: list[str], engine, *, allow_shrink: bool = False
+) -> None:
     """
     Replace all rows for `seasons` in `table` with `df`, deduped on `key`.
     Rows for other seasons are left untouched, so incremental runs are cheap
     and re-running the same season is idempotent.
+
+    Refuses (ETLShrinkError) when the new pull has fewer rows than are stored for
+    those seasons: stats.nba.com can return a short or empty result without an
+    error, and replacing on it would silently delete the season.
     """
     before = len(df)
     df = df.drop_duplicates(subset=key, keep="last")
@@ -185,10 +195,13 @@ def _replace_seasons(df: pd.DataFrame, table: str, key: list[str], seasons: list
     with engine.begin() as conn:
         if inspect(conn).has_table(table):
             placeholders = ",".join(f":s{i}" for i in range(len(seasons)))
-            conn.execute(
-                text(f"DELETE FROM {table} WHERE SEASON IN ({placeholders})"),
-                {f"s{i}": s for i, s in enumerate(seasons)},
-            )
+            params = {f"s{i}": s for i, s in enumerate(seasons)}
+            stored = conn.execute(
+                text(f"SELECT COUNT(*) FROM {table} WHERE SEASON IN ({placeholders})"), params).scalar() or 0
+            if len(df) < stored and not allow_shrink:
+                raise ETLShrinkError(
+                    f"[{table}] new pull has {len(df):,} rows for {seasons}, {stored:,} stored — refusing to shrink")
+            conn.execute(text(f"DELETE FROM {table} WHERE SEASON IN ({placeholders})"), params)
         df.to_sql(table, conn, if_exists="append", index=False, chunksize=500)
     log.info(f"  -> wrote {len(df):,} rows to [{table}] for seasons {seasons}")
     _assert_unique(table, key, engine)
@@ -204,7 +217,7 @@ def _assert_unique(table: str, key: list[str], engine) -> None:
         raise RuntimeError(f"[{table}] has {dupes} duplicate {key} groups after write")
 
 
-def build_historical_store(seasons: list[str] = SEASONS, incremental: bool = False) -> None:
+def build_historical_store(seasons: list[str] = SEASONS, incremental: bool = False, allow_shrink: bool = False) -> None:
     """
     ETL for `seasons`. With incremental=True only the most recent season is
     re-pulled (nightly use). Safe to re-run: each season's rows are replaced.
@@ -215,18 +228,20 @@ def build_historical_store(seasons: list[str] = SEASONS, incremental: bool = Fal
 
     for season in seasons:
         frames = [fetch_player_gamelogs(season, "Regular Season")]
-        po = fetch_player_gamelogs(season, "Playoffs")
-        if not po.empty:
-            frames.append(po)
+        # Play-in games count for rest days and rolling form (stay is_playoffs=0).
+        for season_type in ("PlayIn", "Playoffs"):
+            extra = fetch_player_gamelogs(season, season_type)
+            if not extra.empty:
+                frames.append(extra)
         gl = pd.concat(frames, ignore_index=True)
         gl["GAME_ID"] = gl["GAME_ID"].astype(str)
-        _replace_seasons(gl, "player_gamelogs", GAMELOG_KEY, [season], engine)
+        _replace_seasons(gl, "player_gamelogs", GAMELOG_KEY, [season], engine, allow_shrink=allow_shrink)
 
         trk = fetch_tracking_rebounds(season)
         if not trk.empty:
             _replace_seasons(trk, "tracking_rebounds", TRACKING_KEY, [season], engine)
 
-        _replace_seasons(fetch_schedule(season), "schedule", SCHEDULE_KEY, [season], engine)
+        _replace_seasons(fetch_schedule(season), "schedule", SCHEDULE_KEY, [season], engine, allow_shrink=allow_shrink)
 
     log.info("ETL complete.")
 

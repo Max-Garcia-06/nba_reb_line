@@ -119,6 +119,32 @@ def _latest_game_date() -> str | None:
     return str(d)[:10] if d else None
 
 
+def latest_completed_game_date(engine, *, today: str) -> str | None:
+    """Newest regular-season / play-in / playoff game date before ``today`` (preseason has no box scores)."""
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        d = conn.execute(
+            text("SELECT MAX(GAME_DATE_EST) FROM schedule WHERE GAME_DATE_EST < :t "
+                 "AND substr(GAME_ID, 1, 3) IN ('002', '004', '005')"),
+            {"t": today},
+        ).scalar()
+    return str(d)[:10] if d else None
+
+
+def _latest_completed_scheduled_date() -> str | None:
+    """What the DB should already hold: the newest completed game date before today (ET)."""
+    from zoneinfo import ZoneInfo
+
+    from data_engine import _get_engine
+
+    today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    try:
+        return latest_completed_game_date(_get_engine(), today=today)
+    except Exception:
+        return None
+
+
 def model_data_lag_days() -> int | None:
     """Days between the newest game in the DB and the newest game the model trained on."""
     end, latest = _model_data_end(), _latest_game_date()
@@ -166,6 +192,12 @@ def check_calibrate_preflight(*, live: bool = False) -> CalibratePreflightResult
                 f"Model is {lag}d behind the data (trained through {_model_data_end()}, "
                 f"limit {MODEL_MAX_DATA_LAG_DAYS}d); run train"
             )
+
+    # The model-lag gate compares the model with the DB; if the nightly ETL stopped,
+    # both are stale together. Gate the DB on the schedule: last night's games must be in.
+    expected, have = _latest_completed_scheduled_date(), _latest_game_date()
+    if expected and have and have < expected:
+        _flag(f"player_gamelogs ends {have} but games were scheduled through {expected}; run etl")
 
     from model import get_model_trained_on
 

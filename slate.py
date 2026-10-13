@@ -15,9 +15,11 @@ same point-in-time code path as training (feature_store extra_rows). Markets
 that can't be resolved, or players with thin history, are skipped — never
 priced off the market.
 
-Absences for the teammate-vacuum feature come from injury_feed (OUT players)
-plus an optional manual file data/absent_<date>.json:
+Absences for the teammate-vacuum feature come from the official NBA injury
+report (injury_reports.current_out, per team, status Out) — the same source the
+historical features use — plus an optional manual file data/absent_<date>.json:
     {"OUT": ["Joel Embiid", "Jimmy Butler"]}
+Players now on another team's roster count as absent for their old team.
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ import pandas as pd
 
 import data_engine as de
 from config import DATA_DIR, GAMES_FOR_LAMBDA_SANITY
-from feature_store import build_feature_table
+from feature_store import MIN_TRAILING_MINUTES, build_feature_table
 from identity_bridge import PlayerIndex, norm_player_name
 
 log = logging.getLogger(__name__)
@@ -89,6 +91,16 @@ def load_manual_absences(game_date: str) -> set[str]:
         return set()
 
 
+def _ticker_team(ticker: str, slug: str) -> str:
+    """Tricode the ticker's player segment starts with (e.g. 'OKCJWILLIAMS8'), if it is one of the game's."""
+    parts = str(ticker).split("-")
+    seg = parts[2] if len(parts) >= 3 else ""
+    for code in (slug[:3], slug[3:]):
+        if code and seg.startswith(code):
+            return code
+    return ""
+
+
 def resolve_slate(market_lines: list, game_date: str) -> tuple[dict[str, SlateRow], pd.DataFrame, list[str]]:
     """
     Returns ({ticker: SlateRow}, rosters, unresolved_tickers).
@@ -110,9 +122,14 @@ def resolve_slate(market_lines: list, game_date: str) -> tuple[dict[str, SlateRo
         if not g:
             unresolved.append(ml.ticker)
             continue
-        key = (norm_player_name(ml.player_name), g["game_id"])
+        slug = de.matchup_slug(*mu)
+        code = _ticker_team(ml.ticker, slug)
+        team_ids = [g["away_team_id"]] if code == slug[:3] else [g["home_team_id"]] if code else \
+            [g["home_team_id"], g["away_team_id"]]
+        key = (norm_player_name(ml.player_name), g["game_id"], code)
         if key not in cache:
-            pool = rosters[rosters["TEAM_ID"].isin([g["home_team_id"], g["away_team_id"]])]
+            # The ticker names the player's team: same-name players on the other side can't match.
+            pool = rosters[rosters["TEAM_ID"].isin(team_ids)]
             pid = PlayerIndex(zip(pool["PLAYER_ID"], pool["PLAYER_NAME"])).resolve(ml.player_name)
             if not pid:
                 cache[key] = None
@@ -130,23 +147,43 @@ def resolve_slate(market_lines: list, game_date: str) -> tuple[dict[str, SlateRo
     return out, rosters, unresolved
 
 
-def absences_by_team(game_date: str, rosters: pd.DataFrame) -> dict[int, set[int]]:
-    from injury_feed import out_player_names
+class AbsencesUnavailable(RuntimeError):
+    """No injury report could be read; teammate-vacuum features would silently be 0."""
 
-    names = out_player_names() | load_manual_absences(game_date)
-    if not names:
-        log.warning("No absence info (injury feed empty/unavailable, no manual file): vacuum features = 0")
+
+def absences_by_team(game_date: str, rosters: pd.DataFrame, idx: dict[str, dict]) -> tuple[dict[int, set[int]], bool]:
+    """
+    ({TEAM_ID: {PLAYER_ID}} listed Out, report_available). Names match only within
+    their own team's report entries; the manual file applies to any team.
+    """
+    import injury_reports as ir
+
+    tricode_by_team: dict[int, str] = {}
+    for slug, row in idx.items():
+        tricode_by_team[int(row["away_team_id"])] = slug[:3]
+        tricode_by_team[int(row["home_team_id"])] = slug[3:]
+    report = ir.current_out(game_date)
+    manual = load_manual_absences(game_date)
+    if report is None:
+        log.warning("Official injury report unavailable%s", "; using manual absences only" if manual else
+                    ": vacuum features = 0")
     out: dict[int, set[int]] = {}
     for pid, name, team in zip(rosters["PLAYER_ID"], rosters["PLAYER_NAME"], rosters["TEAM_ID"]):
-        if norm_player_name(name) in names:
+        n = norm_player_name(name)
+        listed = (report or {}).get(tricode_by_team.get(int(team), ""), set())
+        if n in listed or n in manual:
             out.setdefault(int(team), set()).add(int(pid))
-    return out
+    return out, report is not None
 
 
-def build_slate_predictions(market_lines: list, game_date: str, model) -> tuple[list[dict], list, list[str]]:
+def build_slate_predictions(
+    market_lines: list, game_date: str, model, *, require_absences: bool = False
+) -> tuple[list[dict], list, list[str]]:
     """
     Returns (predictions, kept_market_lines, skipped_reasons). predictions[i]
     corresponds to kept_market_lines[i] and carries a full PMF.
+    ``require_absences`` (live trading) raises AbsencesUnavailable when no injury
+    report can be read, instead of pricing with vacuum = 0.
     """
     resolved, rosters, unresolved = resolve_slate(market_lines, game_date)
     skipped = [f"{t}: unresolved player/game" for t in unresolved]
@@ -160,7 +197,11 @@ def build_slate_predictions(market_lines: list, game_date: str, model) -> tuple[
         "OPP_TEAM_ID": r.opp_team_id, "GAME_ID": r.game_id, "GAME_DATE": game_date,
         "SEASON": season, "is_home": r.is_home, "is_playoffs": int(_is_playoffs(r.game_id)),
     } for r in uniq.values()])
-    feats = build_feature_table(extra_rows=extra, absent_override=absences_by_team(game_date, rosters))
+    absent, report_ok = absences_by_team(game_date, rosters, de.slate_schedule_index(game_date))
+    if require_absences and not report_ok:
+        raise AbsencesUnavailable(f"No official injury report readable for {game_date}")
+    feats = build_feature_table(extra_rows=extra, absent_override=absent,
+                                current_team=de.current_team_by_player(game_date))
     feats = feats[feats["_live"]].set_index(["PLAYER_ID", "GAME_ID"])
 
     pmf = model.pmf(feats.reset_index())
@@ -176,6 +217,10 @@ def build_slate_predictions(market_lines: list, game_date: str, model) -> tuple[
         gp = int(f["games_played"]) if f is not None else 0
         if f is None or gp < GAMES_FOR_LAMBDA_SANITY:
             skipped.append(f"{ml.ticker}: thin history (games_played={gp})")
+            continue
+        if float(f["min_roll"]) < MIN_TRAILING_MINUTES:
+            # Training drops these rows; the model has never priced this population.
+            skipped.append(f"{ml.ticker}: min_roll {float(f['min_roll']):.1f} < {MIN_TRAILING_MINUTES:g}")
             continue
         preds.append({
             "player_id": r.player_id, "player_name": ml.player_name, "game_date": game_date,

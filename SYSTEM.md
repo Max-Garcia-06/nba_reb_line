@@ -26,7 +26,7 @@ because of incidents documented there.
 | `model_zoo.py`, `model.py` | candidate rebound PMF models; production wrapper with `trained_on` stamps |
 | `bakeoff.py` | walk-forward PIT model comparison |
 | `kalshi_history.py`, `market_eval.py` | 2025-26 Kalshi book backfill; model vs market on full slates |
-| `slate.py`, `identity_bridge.py`, `injury_feed.py` | tonight's markets → player/game → PIT features |
+| `slate.py`, `identity_bridge.py`, `injury_reports.py` | tonight's markets → player/game → PIT features; official NBA injury reports (history + live) |
 | `probability_engine.py` | PMF → P(over)/P(under), coherent |
 | `calibration.py`, `calibrate_preflight.py` | OOF + fill isotonic/Platt calibrators, staleness and model-mismatch gates |
 | `market_blend.py` | capped logit shrinkage toward the market mid (one monotone curve) |
@@ -68,9 +68,21 @@ earlier dates. Tonight's scan rows go through the same function
   pace, OREB%/DREB%, 3PA rate, expected |margin|) — no season aggregates.
 * Rebound tracking is joined from the **previous** season only.
 * Teammate vacuum: rotation teammates (≥15 trailing MPG, seen within 21 days,
-  still on the team) who don't play. History: no box-score row. Live: injury
-  feed OUT list + `data/absent_<date>.json`. Late scratches after the scan are
-  the remaining gap.
+  still on the team) known to be out before tip. Both history and live use the
+  official NBA injury report (`injury_reports.py`, status Out) — history the latest
+  report ≥60 min before tip (`injury-backfill`, stored in `injury_reports`), live the
+  newest report at scan time — plus players who have left the team (history: next
+  game for another team; live: today's rosters) and `data/absent_<date>.json`.
+  Games before report coverage (2025-26 coverage starts late Dec 2025) fall back to
+  "no box-score row", which includes hindsight. Live scans fail closed when no
+  report can be read.
+
+  Measured on 1,782 covered team-games (Jan–Jun 2026): box scores showed absences
+  not on the pre-tip Out list in 36% of them (mean vacuum_n 2.19 vs 1.71). Of 1,002
+  such absences, 538 were coach's-decision or unlisted absences of fringe rotation
+  players, 198 were Questionable/Doubtful players who then sat, 34 were ruled Out only
+  after the cutoff, 100 never played again and 94 were traded; 10 were name misses
+  (all traded players listed under their new team).
 
 Guards (`tests/test_feature_store_pit.py`): scrambling every outcome on/after
 date D must not move any feature dated ≤ D; live-path rows must equal history
@@ -171,6 +183,14 @@ maker limits, Kelly, live gates incl. bid > 0 and spread ≤ 0.08):
 | Everything fills (upper bound) | 178 | 178 | +17.1% | +1.1% to +33.6% | +0.0054 |
 | Teammate-absence features zeroed | 27 | 9 | −23.4% | −71% to +15% | −0.0062 |
 | **Tier 3 stack** (raw probs, capped blend cap 0.3; fills from trades) | 106 | 68 (64%) | +19.1% | −11.8% to +51.2% | −0.0003 |
+| **Tier 4: pre-tip absences** (official injury reports, whole season) | 40 | 21 (52%) | +21.0% | −26.2% to +70.3% | −0.0064 |
+
+The Tier 4 row (2026-10-13) is the honest one: teammate absences are only what the
+official injury report listed Out at least 60 min before tip, for the whole 2025-26
+season. Most signals were hindsight — 106 became 40 — and what is left is 21 fills
+with negative CLV and a CI from −26% to +70%: **no evidence of an edge**. Full-slate
+ΔLL with these features: +0.0020 (CI −0.0015 to +0.0056); the raw model loses ~0.0007
+log-loss once hindsight is removed (0.5294 → 0.5301) and still ties the market.
 
 The Tier 3 row (2026-10-13) trades less and its fills are calibrated (win rate 51.5% vs
 mean model p 0.503, against 54% vs 0.565 before) with CLV ≈ 0 instead of negative;
@@ -236,11 +256,11 @@ processes.
 
 ## 9. Known gaps
 
-* Retraining runs Sundays inside `nightly` (MLB still has none — its fit takes ~11h).
+* Retraining runs weekly inside `nightly` (MLB still has none — its fit takes ~11h).
   It invalidates the fill calibrator, so set `AUTO_RETRAIN=0` before turning on
   `REQUIRE_FILL_CALIB_FOR_LIVE`, then retrain by hand and recalibrate together.
 * Live rosters (PlayerIndex) are a snapshot of now: same-day trades show up only
   once stats.nba.com updates them; until then the player is skipped or on his old team.
-* Injury feed is unofficial (ESPN JSON) and fails open (vacuum = 0, logged).
+* Official injury reports exist as PDFs from late Dec 2025; earlier games keep box-score absences.
 * No hyper-parameter tuning was ported (`tune`); model_zoo params are hand-set.
 * Fill-based calibrator and segment blocks need NBA fills that don't exist yet.

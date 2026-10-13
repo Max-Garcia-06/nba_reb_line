@@ -27,13 +27,13 @@ Kalshi ◄──scan──────┘  slate.py: markets → (player, team, 
 | Phase | Command(s) | Output |
 |---|---|---|
 | Data | `etl [--incremental]` | `data/nba_reb.db` |
-| History | `python kalshi_history.py markets` / `candles` | `kalshi_markets`, `kalshi_candles` (2025-26) |
+| History | `python kalshi_history.py markets` / `candles`, `injury-backfill --start --end` | `kalshi_markets`, `kalshi_candles` (2025-26), `injury_reports` |
 | Model | `train`, `evaluate` | model + OOF calibrator; walk-forward scores |
 | Research | `python bakeoff.py run/summary`, `python market_eval.py` | model zoo comparison; model vs Kalshi |
 | Markets | `snapshot`, `schedule-snapshots` | `data/snapshots/` |
 | Trade | `scan [--live]`, `mark`, `reconcile` | journal, execution ledger |
 | Review | `report`, `report-range`, `calibrate`, `segment-report` | P&L net of fees, calibrators, go/no-go |
-| Blend | `refit-blend` (capped blend, Sundays), `model-vs-market` | `models/blend_meta.json` |
+| Blend | `refit-blend` (capped blend, weekly), `model-vs-market` | `models/blend_meta.json` |
 
 ## 2. Setup
 
@@ -75,8 +75,8 @@ automatically (`AUTO_KILL_ON_RISK_BREACH=true`).
 ```
 
 Early season: players' rolling windows reach back into last season; `games_in_season`
-and prior-season tracking tell the model how stale that is. `nightly` retrains every
-Sunday (`AUTO_RETRAIN`, ~1 min); live scans refuse once the model trails the newest DB
+and prior-season tracking tell the model how stale that is. `nightly` retrains once a
+week (`AUTO_RETRAIN`, ~1 min); live scans refuse once the model trails the newest DB
 game by `MODEL_MAX_DATA_LAG_DAYS` (14), so a retrain that silently stops can't go unnoticed.
 
 Offseason moves: on today/future slates `slate.recent_rosters` takes each player's team
@@ -91,7 +91,7 @@ he plays for the new one. Historical dates and API failures fall back to last-pl
 | 12:00–22:00 every 2h | `snapshot` (cron) |
 | 17:05–23:05 hourly | `scan` (dry-run cron; `scan-live` when trusted). Only games tipping within `SCAN_WITHIN_HOURS`=1.5 |
 | before tip, optional | `data/absent_YYYY-MM-DD.json` `{"OUT": ["Name", ...]}` to add late scratches the injury feed missed |
-| 04:30 (launchd) | `nightly`: `etl --incremental`, `reconcile` (3-day lookback), `report`; Sundays also `train` + `refit-blend` |
+| 04:30 (launchd) | `nightly`: `etl --incremental`, `injury-backfill` (yesterday), `reconcile` (3-day lookback), `report`; weekly (>6 days since last) also `train` + `refit-blend`. Steps run independently |
 
 Scan skips — never prices off the market — any market whose player can't be resolved to
 tonight's game or has fewer than `GAMES_FOR_LAMBDA_SANITY` games.

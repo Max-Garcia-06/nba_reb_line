@@ -37,10 +37,12 @@ import numpy as np
 import pandas as pd
 
 import data_engine as de
-from config import MIN_GAMES, ROLLING_WINDOW
+from config import MIN_GAMES, PREGAME_ABSENCES, ROLLING_WINDOW
 
 TEAM_WINDOW = 15
 EWM_HALFLIFE = 6.0
+# Bump whenever feature semantics change: PIT model caches are keyed by it.
+FEATURE_VERSION = "v2-pregame-absences"
 ROTATION_MIN = 15.0          # trailing MPG to count as a rotation player
 ROTATION_MAX_GAP_DAYS = 21   # last appearance within this many days
 MIN_TRAILING_MINUTES = 15.0  # training population, matches Kalshi prop universe
@@ -197,20 +199,37 @@ def _asof(left: pd.DataFrame, right: pd.DataFrame, by: str, left_by: Optional[st
 # Teammate vacuum
 # ---------------------------------------------------------------------------
 
+def _next_team(cand: pd.DataFrame, appearances: pd.DataFrame) -> pd.Series:
+    """TEAM_ID of each candidate's first game strictly after the row's date (NaN if none)."""
+    left = cand[["PLAYER_ID", "GAME_DATE"]].reset_index().rename(columns={"index": "_row"})
+    right = appearances[["PLAYER_ID", "GAME_DATE", "TEAM_ID"]].rename(columns={"TEAM_ID": "_next_team"})
+    right = right.sort_values("GAME_DATE")
+    out = pd.merge_asof(left.sort_values("GAME_DATE"), right, on="GAME_DATE", by="PLAYER_ID",
+                        allow_exact_matches=False, direction="forward")
+    return out.set_index("_row")["_next_team"].reindex(cand.index)
+
+
 def teammate_vacuum(
     targets: pd.DataFrame,
     pstate: pd.DataFrame,
     roster_pool: pd.DataFrame,
     played: set[tuple[int, str]],
     absent_override: Optional[dict[int, set[int]]] = None,
+    pregame_out: Optional[dict[tuple[str, int], set[int]]] = None,
+    appearances: Optional[pd.DataFrame] = None,
+    current_team: Optional[dict[int, int]] = None,
 ) -> pd.DataFrame:
     """
     For each (TEAM_ID, GAME_ID) in targets: rebounds and minutes of rotation
-    teammates who are NOT playing.
+    teammates who are NOT playing, as knowable before tip.
 
-    History: 'not playing' = no box-score row for that game. In live use the
-    equivalent is the official inactive/injury list (known before tip), passed
-    via absent_override {TEAM_ID: {PLAYER_ID, ...}} for tonight's games.
+    * Live games: listed Out (``absent_override`` {TEAM_ID: {PLAYER_ID}}, from the
+      official injury report) or now on another team's roster (``current_team``).
+    * Historical games the injury reports cover (``pregame_out`` {(GAME_ID, TEAM_ID):
+      {PLAYER_ID}}): listed Out before the decision time, or departed — their next
+      game is for another team (traded/waived; public before tip).
+    * Older games without report coverage: no box-score row (includes late
+      scratches — hindsight live does not have).
     """
     tgames = targets[["TEAM_ID", "GAME_ID", "GAME_DATE", "SEASON"]].drop_duplicates(["TEAM_ID", "GAME_ID"])
     cand = tgames.merge(roster_pool, on=["TEAM_ID", "SEASON"])
@@ -222,10 +241,23 @@ def teammate_vacuum(
 
     live_games = set(targets.loc[targets["_live"], "GAME_ID"])
     override = absent_override or {}
-    rot["absent"] = [
-        (pid in override.get(tid, set())) if gid in live_games else ((pid, gid) not in played)
-        for pid, tid, gid in zip(rot["PLAYER_ID"], rot["TEAM_ID"], rot["GAME_ID"])
-    ]
+    reports = pregame_out or {}
+    now_team = current_team or {}
+    if reports and appearances is not None and len(rot):
+        nxt = _next_team(rot, appearances)
+        departed_hist = nxt.notna() & (nxt != rot["TEAM_ID"])
+    else:
+        departed_hist = pd.Series(False, index=rot.index)
+
+    absent = []
+    for pid, tid, gid, dep in zip(rot["PLAYER_ID"], rot["TEAM_ID"], rot["GAME_ID"], departed_hist):
+        if gid in live_games:
+            absent.append(pid in override.get(tid, set()) or now_team.get(pid, tid) != tid)
+        elif (gid, tid) in reports:
+            absent.append(pid in reports[(gid, tid)] or bool(dep))
+        else:
+            absent.append((pid, gid) not in played)
+    rot["absent"] = absent
 
     ab = rot[rot["absent"]]
     vac = ab.groupby(["TEAM_ID", "GAME_ID"]).agg(
@@ -244,6 +276,8 @@ def build_feature_table(
     gamelogs: Optional[pd.DataFrame] = None,
     tracking: Optional[pd.DataFrame] = None,
     apply_filters: bool = True,
+    pregame_out: Optional[dict[tuple[str, int], set[int]]] = None,
+    current_team: Optional[dict[int, int]] = None,
 ) -> pd.DataFrame:
     """
     Parameters
@@ -252,6 +286,10 @@ def build_feature_table(
                       PLAYER_ID, PLAYER_NAME, TEAM_ID, OPP_TEAM_ID, GAME_ID,
                       GAME_DATE, SEASON, is_home, is_playoffs. REB is NaN.
     absent_override : {TEAM_ID: {PLAYER_ID}} confirmed-out players for extra_rows games.
+    pregame_out     : {(GAME_ID, TEAM_ID): {PLAYER_ID}} listed Out before the decision time
+                      for historical games (default: loaded from the injury_reports table
+                      when gamelogs come from SQLite and PREGAME_ABSENCES is on).
+    current_team    : {PLAYER_ID: TEAM_ID} from tonight's rosters (live traded players).
     gamelogs, tracking : inject frames (tests); default loads from SQLite.
     apply_filters   : drop thin-history / low-minute rows (training population).
                       Extra rows are never filtered.
@@ -318,7 +356,12 @@ def build_feature_table(
     # Teammate vacuum
     pool = gl[["TEAM_ID", "SEASON", "PLAYER_ID"]].drop_duplicates()
     played = set(zip(gl["PLAYER_ID"], gl["GAME_ID"]))
-    vac = teammate_vacuum(df, pstate, pool, played, absent_override)
+    if pregame_out is None and gamelogs is None and PREGAME_ABSENCES:
+        from injury_reports import pregame_out_for_gamelogs
+
+        pregame_out = pregame_out_for_gamelogs(gl)
+    vac = teammate_vacuum(df, pstate, pool, played, absent_override, pregame_out=pregame_out,
+                          appearances=gl[["PLAYER_ID", "GAME_DATE", "TEAM_ID"]], current_team=current_team)
     df = df.merge(vac, on=["TEAM_ID", "GAME_ID"], how="left")
     for c in ("vacuum_reb", "vacuum_min", "vacuum_n"):
         df[c] = df[c].fillna(0.0)

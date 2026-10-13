@@ -96,3 +96,45 @@ def test_current_team_by_player_survives_api_failure(monkeypatch):
     monkeypatch.setattr(de, "_fetch_current_rosters", boom)
     monkeypatch.setattr(de, "_today_et", lambda: "2026-10-20")
     assert de.current_team_by_player("2026-10-21") == {}
+
+
+# ---------- live absences from the official injury report ----------
+
+_IDX = {"HOUWAS": {"game_id": "0022500900", "home_team_id": 20, "away_team_id": 10,
+                   "status": "Scheduled", "start_utc": None}}
+_ROSTERS = pd.DataFrame({"PLAYER_ID": [1, 2, 3], "PLAYER_NAME": ["Steven Adams", "Alex Sarr", "Fred VanVleet"],
+                         "TEAM_ID": [10, 20, 10]})
+
+
+def test_live_absences_come_from_the_report_per_team(monkeypatch):
+    import injury_reports as ir
+
+    monkeypatch.setattr(ir, "current_out", lambda d, **kw: {"HOU": {"steven adams"}, "WAS": {"fred vanvleet"}})
+    monkeypatch.setattr(slate, "load_manual_absences", lambda d: set())
+    out, ok = slate.absences_by_team("2026-03-02", _ROSTERS, _IDX)
+    assert ok and out == {10: {1}}  # VanVleet listed under WAS is not applied to HOU
+
+
+def test_live_absences_flag_unavailable_report(monkeypatch):
+    import injury_reports as ir
+
+    monkeypatch.setattr(ir, "current_out", lambda d, **kw: None)
+    monkeypatch.setattr(slate, "load_manual_absences", lambda d: {"alex sarr"})
+    out, ok = slate.absences_by_team("2026-03-02", _ROSTERS, _IDX)
+    assert not ok and out == {20: {2}}  # manual file still applied
+
+
+def test_current_out_reads_latest_report_for_the_date(monkeypatch, tmp_path):
+    from datetime import datetime
+
+    import injury_reports as ir
+
+    monkeypatch.setattr(ir, "latest_report_before", lambda cut, **kw: (cut, tmp_path / "r.pdf"))
+    monkeypatch.setattr(ir, "parse_pdf", lambda p: [
+        {"game_date": "2026-03-02", "matchup": "HOU@WAS", "team": "HOU", "player_name": "Steven Adams", "status": "Out"},
+        {"game_date": "2026-03-02", "matchup": "HOU@WAS", "team": "HOU", "player_name": "Jabari Smith Jr.",
+         "status": "Questionable"},
+        {"game_date": "2026-03-03", "matchup": "DAL@CHA", "team": "DAL", "player_name": "Kyrie Irving", "status": "Out"},
+    ])
+    out = ir.current_out("2026-03-02", now_et=datetime(2026, 3, 2, 18, 0))
+    assert out == {"HOU": {"steven adams"}}

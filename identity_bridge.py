@@ -8,7 +8,8 @@ opaque `custom_strike.basketball_player` UUID that is not an NBA id. Matching is
 done on a normalised name (accents, punctuation, Jr./III suffixes stripped),
 restricted to the two teams in the game when a roster is given so same-name
 collisions can't cross teams. Fallback: first initial + last name, accepted
-only when unique.
+only when unique AND the first names are compatible (one a prefix of the other,
+or a known nickname) — "Jalen Williams" must never resolve to "Jaylin Williams".
 
 The old scan matched `PLAYER_NAME.lower() == name.lower()`, which silently
 missed every accented name; on the 2025-26 history this normaliser maps 98.7%
@@ -35,16 +36,31 @@ def _initial_last(norm: str) -> str:
     return f"{t[0][0]} {t[-1]}" if t else ""
 
 
+# Nicknames that are not prefixes of the legal first name.
+_NICKNAMES = {"moe": "moritz", "bub": "carrington", "nene": "maybyner", "deuce": "fred", "trey": "william"}
+
+
+def _first_names_compatible(a: str, b: str) -> bool:
+    fa, fb = (a.split() or [""])[0], (b.split() or [""])[0]
+    if len(fa) <= 1 or len(fb) <= 1:  # an initial ("J. Williams") matches any first name
+        return True
+    if fa.startswith(fb) or fb.startswith(fa):
+        return True
+    return _NICKNAMES.get(fa) == fb or _NICKNAMES.get(fb) == fa
+
+
 class PlayerIndex:
     """name -> PLAYER_ID lookup over a candidate pool (e.g. both teams' players tonight)."""
 
     def __init__(self, players: Iterable[tuple[int, str]]):
         self.by_name: dict[str, set[int]] = {}
         self.by_short: dict[str, set[int]] = {}
+        self.names: dict[int, str] = {}
         for pid, name in players:
             n = norm_player_name(name)
             self.by_name.setdefault(n, set()).add(int(pid))
             self.by_short.setdefault(_initial_last(n), set()).add(int(pid))
+            self.names[int(pid)] = n
 
     def resolve(self, player_name: str) -> int:
         n = norm_player_name(player_name)
@@ -54,7 +70,9 @@ class PlayerIndex:
         if not hits:
             short = self.by_short.get(_initial_last(n), set())
             if len(short) == 1:
-                return next(iter(short))
+                pid = next(iter(short))
+                if _first_names_compatible(n, self.names[pid]):
+                    return pid
         return 0
 
 

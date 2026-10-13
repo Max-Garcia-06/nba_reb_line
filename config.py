@@ -151,6 +151,9 @@ ROLLING_WINDOW = 10
 
 # Minimum games for a player to include in training
 MIN_GAMES = 15
+# Historical teammate absences from official injury reports (as of tip − 60 min) where
+# the injury_reports table covers a game, instead of box-score hindsight.
+PREGAME_ABSENCES = os.getenv("PREGAME_ABSENCES", "true").lower() in ("1", "true", "yes")
 
 # Walk-forward CV controls (split by unique game_date)
 CV_GAP_DATES = int(os.getenv("CV_GAP_DATES", "1"))  # embargo gap between train and test folds (in unique dates)

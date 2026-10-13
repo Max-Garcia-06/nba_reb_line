@@ -90,36 +90,44 @@ case "$JOB" in
     run_py report --date "$YESTERDAY_ET"
     ;;
   nightly)
-    # ETL, reconcile the recent slates' fills, then report against yesterday's.
-    run_py etl --incremental
+    # Each step runs even if an earlier one fails (set -e used to skip everything
+    # after a flaky stats.nba.com ETL, including reconcile and the weekly retrain).
+    etl_ok=1
+    run_py etl --incremental || { etl_ok=0; log "etl failed — continuing; weekly retrain/refit skipped"; }
+    # Official injury reports for yesterday's games (pre-tip absences for features).
+    run_py injury-backfill --start "$YESTERDAY_ET" --end "$YESTERDAY_ET" || log "injury-backfill failed"
     for d in $(recent_et_dates); do
       run_py reconcile --date "$d" || true
     done
-    run_py report --date "$YESTERDAY_ET"
-    # Piggyback the weekly blend refit on this job (Sundays only) instead of a
-    # standalone 5am cron slot: that slot silently missed 2 straight Sundays
-    # because the laptop was asleep at exactly 5am.
-    if [[ "$(TZ=America/New_York date '+%u')" == "7" ]]; then
-      # Weekly retrain on the freshly ETL'd data (~1 min). mlb_tb_line never got a
-      # retrain cron (its fit takes ~11h) and ran 19 days on a stale model; here a
-      # failed fit leaves the previous model in place and calibrate_preflight
-      # blocks live scans once it falls MODEL_MAX_DATA_LAG_DAYS behind the data.
-      # AUTO_RETRAIN=0 in .env turns this off (e.g. once a fill calibrator exists:
-      # every retrain invalidates it, and REQUIRE_FILL_CALIB_FOR_LIVE then blocks live).
-      auto_retrain="$(grep -E '^AUTO_RETRAIN=' .env 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"' || true)"
-      if [[ "${auto_retrain:-1}" != "0" ]]; then
-        log "Sunday — retraining model"
-        run_py train || log "train failed — previous model stays in place"
+    run_py report --date "$YESTERDAY_ET" || log "report failed"
+    # Weekly retrain + blend refit, due when the last successful one is >6 days old
+    # (a stamp file, not "is it Sunday": a launchd catch-up run on Monday used to
+    # skip the week). AUTO_RETRAIN=0 in .env turns the retrain off (e.g. once a fill
+    # calibrator exists: every retrain invalidates it, and REQUIRE_FILL_CALIB_FOR_LIVE
+    # then blocks live). A failed fit leaves the previous model in place and
+    # calibrate_preflight blocks live once it falls MODEL_MAX_DATA_LAG_DAYS behind.
+    stamp="${LOG_DIR}/.last_weekly_refit"
+    now_s="$(date +%s)"
+    last_s="$( [[ -f "$stamp" ]] && stat -f %m "$stamp" || echo 0 )"
+    if (( now_s - last_s > 6 * 86400 )); then
+      if [[ "$etl_ok" == "1" ]]; then
+        auto_retrain="$(grep -E '^AUTO_RETRAIN=' .env 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"' || true)"
+        if [[ "${auto_retrain:-1}" != "0" ]]; then
+          log "Weekly — retraining model"
+          run_py train || log "train failed — previous model stays in place"
+        fi
+        log "Weekly — running refit-blend"
+        run_py refit-blend && touch "$stamp"
+      else
+        log "Weekly retrain/refit due but ETL failed — will retry next run"
       fi
-      log "Sunday — also running refit-blend"
-      run_py refit-blend
     fi
     ;;
   refit-blend)
     # Re-fit market-blend weight (global + per-segment) from a trailing window of
     # full-slate scoring, so w tracks the model's actual recent performance vs.
     # the market instead of staying pinned wherever it was last set by hand.
-    # Runs automatically as part of `nightly` on Sundays (see above); this case
+    # Runs automatically as part of `nightly` once a week (see above); this case
     # remains for manual/ad-hoc re-fits.
     run_py refit-blend
     ;;

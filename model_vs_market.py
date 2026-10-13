@@ -211,13 +211,20 @@ def calibrate_results(prs: list, game_date: str, pit_train: bool) -> None:
         pr.p_under_calibrated = 1.0 - pr.p_over_calibrated
 
 
+def _pit_cache_path(as_of: str):
+    """Cache file for the PIT model of week ``as_of``, keyed by family and feature version."""
+    import feature_store
+
+    return PIT_CACHE / f"{MODEL_FAMILY}_{feature_store.FEATURE_VERSION}_{as_of}.pkl"
+
+
 def _pit_model(game_date: str, pit_train: bool):
     from model import load_model, train_as_of
 
     if not pit_train:
         return load_model()[0]
     as_of = _week_start(game_date)
-    path = PIT_CACHE / f"{MODEL_FAMILY}_{as_of}.pkl"
+    path = _pit_cache_path(as_of)
     if path.exists():
         with open(path, "rb") as f:
             return pickle.load(f)

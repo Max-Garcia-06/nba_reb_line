@@ -133,3 +133,13 @@ def test_bucket_file_still_gates_in_legacy_mode(env, monkeypatch):
     (env / "blend.json").write_text(json.dumps({"w": 0.4, "end": "2026-06-13"}))
     (env / "blend_seg.json").write_text(json.dumps({"end": "2026-03-31", "segments": {}}))
     assert not check_calibrate_preflight(live=True).ok
+
+
+def test_pit_cache_key_changes_with_feature_version(monkeypatch, tmp_path):
+    import model_vs_market as mvm
+
+    monkeypatch.setattr(mvm, "PIT_CACHE", tmp_path)
+    monkeypatch.setattr("feature_store.FEATURE_VERSION", "vA")
+    a = mvm._pit_cache_path("2026-04-06")
+    monkeypatch.setattr("feature_store.FEATURE_VERSION", "vB")
+    assert mvm._pit_cache_path("2026-04-06") != a

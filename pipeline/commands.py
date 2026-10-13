@@ -53,6 +53,7 @@ def _event_ticker_from_ml(ml0) -> str:
 def etl(
     seasons: str = typer.Option(None, "--seasons", help="Comma-separated seasons, e.g. '2024-25,2025-26'"),
     incremental: bool = typer.Option(False, "--incremental", help="Re-pull only the latest season (nightly)."),
+    allow_shrink: bool = typer.Option(False, "--allow-shrink", help="Accept a re-pull with fewer rows than stored (known correction)."),
 ):
     _header("Phase 1 — ETL: Pull NBA Game Logs, Tracking, Schedule")
     import data_engine as de
@@ -62,8 +63,30 @@ def etl(
     console.print(f"Seasons    : {season_list}")
     console.print(f"Incremental: {incremental}")
     console.print(f"Database   : {DB_PATH}\n")
-    de.build_historical_store(season_list, incremental=incremental)
+    try:
+        de.build_historical_store(season_list, incremental=incremental, allow_shrink=allow_shrink)
+    except de.ETLShrinkError as e:
+        console.print(f"[red]{e}. Stored data kept; re-run later or pass --allow-shrink if the drop is real.[/red]")
+        raise typer.Exit(1)
     _success("ETL complete.")
+
+
+def injury_backfill(
+    start: str = typer.Option(..., "--start", help="First game date YYYY-MM-DD."),
+    end: str = typer.Option(..., "--end", help="Last game date YYYY-MM-DD."),
+    lead_min: int = typer.Option(60, "--lead-min", help="Use the latest report at least this many minutes before tip."),
+):
+    """Download and store official NBA injury reports for historical games (pre-tip knowable absences)."""
+    import pandas as pd
+
+    import injury_reports as ir
+    from data_engine import _get_engine
+
+    _header(f"Injury report backfill — {start} → {end}")
+    eng = _get_engine()
+    sched = pd.read_sql("SELECT GAME_DATE_EST, TIP_UTC FROM schedule", eng)
+    n = ir.backfill(start, end, lead_min=lead_min, engine=eng, schedule=sched)
+    _success(f"Stored {n:,} report rows in {ir.TABLE}.")
 
 
 def train():
@@ -286,7 +309,14 @@ def scan(
 
         # Point-in-time features for tonight's games (same code path as training).
         # Unresolved players / thin history are skipped — never priced off the market.
-        predictions, market_lines, skipped = build_slate_predictions(market_lines, game_date, trained_model)
+        from slate import AbsencesUnavailable
+
+        try:
+            predictions, market_lines, skipped = build_slate_predictions(
+                market_lines, game_date, trained_model, require_absences=not dry_run)
+        except AbsencesUnavailable as e:
+            console.print(f"[red]{e} — not trading on vacuum features that would read 0.[/red]")
+            raise typer.Exit(1)
         for msg in skipped:
             console.print(f"[dim]Skip {msg}[/dim]")
         if not predictions:
