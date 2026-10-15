@@ -34,7 +34,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 import pandas as pd
 import requests
@@ -58,7 +58,7 @@ _MONTHS = {m: i for i, m in enumerate(
 
 
 def _engine():
-    return create_engine(f"sqlite:///{DB_PATH}")
+    return create_engine(f"sqlite:///{DB_PATH}", connect_args={"timeout": 60})
 
 
 def _ts(iso: str) -> int:

@@ -56,7 +56,7 @@ SCHEDULE_KEY = ["GAME_ID"]
 
 
 def _get_engine():
-    return create_engine(f"sqlite:///{DB_PATH}")
+    return create_engine(f"sqlite:///{DB_PATH}", connect_args={"timeout": 60})
 
 
 def _call(fn, *args, **kwargs) -> list[pd.DataFrame]:
@@ -351,22 +351,6 @@ def matchup_slug(away_abbr: str, home_abbr: str) -> str:
 
 def game_status_allows_scan(status: str) -> bool:
     return (status or "").strip() not in _STARTED_GAME_STATUSES
-
-
-def _parse_game_datetime_utc(raw: str) -> datetime | None:
-    """Parse MLB ``game_datetime`` (e.g. ``2026-05-24T16:15:00Z``) to aware UTC."""
-    s = (raw or "").strip()
-    if not s:
-        return None
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
 
 
 def _event_ticker_from_market_line(ml) -> str:
