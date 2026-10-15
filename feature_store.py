@@ -37,12 +37,10 @@ import numpy as np
 import pandas as pd
 
 import data_engine as de
-from config import MIN_GAMES, PREGAME_ABSENCES, ROLLING_WINDOW
+from config import DECISION_LEAD_MIN, FEATURE_GROUPS as _CONFIG_GROUPS, MIN_GAMES, PREGAME_ABSENCES, ROLLING_WINDOW
 
 TEAM_WINDOW = 15
 EWM_HALFLIFE = 6.0
-# Bump whenever feature semantics change: PIT model caches are keyed by it.
-FEATURE_VERSION = "v2-pregame-absences"
 ROTATION_MIN = 15.0          # trailing MPG to count as a rotation player
 ROTATION_MAX_GAP_DAYS = 21   # last appearance within this many days
 MIN_TRAILING_MINUTES = 15.0  # training population, matches Kalshi prop universe
@@ -50,7 +48,7 @@ MIN_TRAILING_MINUTES = 15.0  # training population, matches Kalshi prop universe
 ID_COLS = ["PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "OPP_TEAM_ID", "GAME_ID", "GAME_DATE", "SEASON"]
 TARGET = "REB"
 
-MODEL_FEATURES = [
+BASE_FEATURES = [
     # player form
     "reb_roll", "reb_ewm", "reb_std_roll", "oreb_roll", "dreb_roll",
     "reb36_roll", "reb36_ewm", "min_roll", "min_ewm", "min_std_roll",
@@ -65,6 +63,35 @@ MODEL_FEATURES = [
     # teammate vacuum
     "vacuum_reb", "vacuum_min", "vacuum_n",
 ]
+
+# Optional groups (FEATURE_GROUPS env). See docs/superpowers/specs/2026-10-14-new-information-sources-design.md.
+FEATURE_GROUPS: dict[str, list[str]] = {
+    "travel": ["travel_km", "tz_shift", "high_altitude_venue", "games_last_7", "opp_rest_days"],
+    "opp_vacuum": ["opp_vacuum_reb", "opp_vacuum_min", "opp_vacuum_n"],
+    "tracking": ["reb_chances_roll", "reb_chances_ewm", "reb_chances36_roll", "reb_conv_roll",
+                 "reb_contest_pct_roll", "reb_defer_rate_roll", "oreb_chance_share_roll"],
+    "lineup": ["starts_tonight", "start_rate_roll", "role_change", "team_usual_starters_out"],
+    "game_market": ["mkt_total", "mkt_spread_abs", "mkt_total_resid"],
+    # Modifier, no columns: adds the pre-tip Inactive list (lineups JSON) to vacuum absences.
+    "inactive": [],
+}
+
+
+def model_features(groups) -> list[str]:
+    unknown = set(groups) - set(FEATURE_GROUPS)
+    if unknown:
+        raise ValueError(f"Unknown FEATURE_GROUPS: {sorted(unknown)}")
+    return BASE_FEATURES + [c for g in sorted(set(groups)) for c in FEATURE_GROUPS[g]]
+
+
+def feature_version(groups, lead_min: int) -> str:
+    """PIT model caches and feature caches are keyed by this; bump the prefix when semantics change."""
+    return f"v3-lead{lead_min}-" + ("+".join(sorted(set(groups))) or "base")
+
+
+ENABLED_GROUPS = sorted(set(_CONFIG_GROUPS))
+MODEL_FEATURES = model_features(ENABLED_GROUPS)
+FEATURE_VERSION = feature_version(ENABLED_GROUPS, DECISION_LEAD_MIN)
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +305,7 @@ def build_feature_table(
     apply_filters: bool = True,
     pregame_out: Optional[dict[tuple[str, int], set[int]]] = None,
     current_team: Optional[dict[int, int]] = None,
+    groups: Optional[list[str]] = None,
 ) -> pd.DataFrame:
     """
     Parameters
@@ -293,7 +321,10 @@ def build_feature_table(
     gamelogs, tracking : inject frames (tests); default loads from SQLite.
     apply_filters   : drop thin-history / low-minute rows (training population).
                       Extra rows are never filtered.
+    groups          : optional feature groups to attach (default: ENABLED_GROUPS).
     """
+    groups = ENABLED_GROUPS if groups is None else sorted(set(groups))
+    feature_cols = model_features(groups)
     gl = clean_gamelogs(de.load_gamelogs() if gamelogs is None else gamelogs)
     trk = de.load_tracking_rebounds() if tracking is None else tracking
 
@@ -366,10 +397,15 @@ def build_feature_table(
     for c in ("vacuum_reb", "vacuum_min", "vacuum_n"):
         df[c] = df[c].fillna(0.0)
 
+    # An enabled group whose source data is missing yields NaN columns, not a KeyError.
+    for c in feature_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+
     if apply_filters:
         hist = ~df["_live"]
         keep = (df["games_played"] >= MIN_GAMES) & (df["min_roll"] >= MIN_TRAILING_MINUTES)
         df = df[~hist | keep]
 
     # MIN is an outcome (actual minutes), kept only as a training target — never a feature.
-    return df[ID_COLS + ["_live", TARGET, "MIN", "last_game_date"] + MODEL_FEATURES].reset_index(drop=True)
+    return df[ID_COLS + ["_live", TARGET, "MIN", "last_game_date"] + feature_cols].reset_index(drop=True)

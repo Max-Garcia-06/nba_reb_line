@@ -154,6 +154,15 @@ MIN_GAMES = 15
 # Historical teammate absences from official injury reports (as of tip − 60 min) where
 # the injury_reports table covers a game, instead of box-score hindsight.
 PREGAME_ABSENCES = os.getenv("PREGAME_ABSENCES", "true").lower() in ("1", "true", "yes")
+# Optional feature groups (feature_store.FEATURE_GROUPS), comma-separated, e.g.
+# "travel,opp_vacuum". All off until the walk-forward ablation (bakeoff.py ablation)
+# shows a group helps; the model records the list it was trained on and live
+# preflight refuses a mismatch.
+FEATURE_GROUPS = [g.strip() for g in os.getenv("FEATURE_GROUPS", "").split(",") if g.strip()]
+# Point-in-time decision time for historical features: only information published at
+# or before tip - DECISION_LEAD_MIN (injury reports, lineups, game-market candles).
+# Live scans run between T-60 and T-5, so 30 is the middle of the live window.
+DECISION_LEAD_MIN = int(os.getenv("DECISION_LEAD_MIN", "30"))
 
 # Walk-forward CV controls (split by unique game_date)
 CV_GAP_DATES = int(os.getenv("CV_GAP_DATES", "1"))  # embargo gap between train and test folds (in unique dates)

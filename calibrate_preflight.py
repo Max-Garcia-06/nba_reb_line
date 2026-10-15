@@ -106,6 +106,18 @@ def _model_data_end() -> str | None:
         return None
 
 
+def _model_features() -> list[str] | None:
+    import pickle
+
+    from model import META_PATH
+
+    try:
+        with open(META_PATH, "rb") as f:
+            return pickle.load(f).get("features")
+    except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+        return None
+
+
 def _latest_game_date() -> str | None:
     from sqlalchemy import text
 
@@ -192,6 +204,13 @@ def check_calibrate_preflight(*, live: bool = False) -> CalibratePreflightResult
                 f"Model is {lag}d behind the data (trained through {_model_data_end()}, "
                 f"limit {MODEL_MAX_DATA_LAG_DAYS}d); run train"
             )
+
+    from feature_store import ENABLED_GROUPS, MODEL_FEATURES
+
+    trained_feats = _model_features()
+    if trained_feats is not None and list(trained_feats) != list(MODEL_FEATURES):
+        _flag(f"Model was trained on a different feature set ({len(trained_feats)} features) than "
+              f"FEATURE_GROUPS={ENABLED_GROUPS} ({len(MODEL_FEATURES)} features); run train")
 
     # The model-lag gate compares the model with the DB; if the nightly ETL stopped,
     # both are stale together. Gate the DB on the schedule: last night's games must be in.

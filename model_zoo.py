@@ -20,7 +20,6 @@ model is refit on the full window with that round count.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
 
 import lightgbm as lgb
 import numpy as np
@@ -28,7 +27,7 @@ import pandas as pd
 import xgboost as xgb
 from scipy import optimize, special, stats
 
-from feature_store import MODEL_FEATURES
+from feature_store import BASE_FEATURES, MODEL_FEATURES
 
 TOP = 20                 # top bucket = 20+ rebounds (Kalshi max line 17.5 seen)
 CALIB_FRAC = 0.15
@@ -98,7 +97,7 @@ def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return df[df["GAME_DATE"] < cut], df[df["GAME_DATE"] >= cut]
 
 
-def _xgb_fit(objective: str, tr: pd.DataFrame, ca: pd.DataFrame, full: pd.DataFrame,
+def _xgb_fit(objective: str, tr: pd.DataFrame, ca: pd.DataFrame, full: pd.DataFrame, feats: list[str],
              target: str = "REB", margin: str | None = None, **over) -> tuple[xgb.XGBRegressor, xgb.XGBRegressor]:
     """Fit on tr with early stop on ca; refit on full with best round count.
     Returns (holdout_model, full_model)."""
@@ -106,13 +105,13 @@ def _xgb_fit(objective: str, tr: pd.DataFrame, ca: pd.DataFrame, full: pd.DataFr
     kw_tr = {"base_margin": tr[margin].values} if margin else {}
     kw_ca = {"base_margin_eval_set": [ca[margin].values]} if margin else {}
     m_ho = xgb.XGBRegressor(**params)
-    m_ho.fit(tr[MODEL_FEATURES], tr[target], eval_set=[(ca[MODEL_FEATURES], ca[target])],
+    m_ho.fit(tr[feats], tr[target], eval_set=[(ca[feats], ca[target])],
              verbose=False, **kw_tr, **kw_ca)
     best = max(50, int((m_ho.best_iteration or 0) + 1))
     p_full = {k: v for k, v in params.items() if k != "early_stopping_rounds"}
     p_full["n_estimators"] = int(best * 1.1)
     m_full = xgb.XGBRegressor(**p_full)
-    m_full.fit(full[MODEL_FEATURES], full[target], verbose=False,
+    m_full.fit(full[feats], full[target], verbose=False,
                **({"base_margin": full[margin].values} if margin else {}))
     return m_ho, m_full
 
@@ -124,7 +123,16 @@ def _xgb_fit(objective: str, tr: pd.DataFrame, ca: pd.DataFrame, full: pd.DataFr
 class Model:
     name = "base"
 
-    def fit(self, df: pd.DataFrame) -> "Model":
+    def _use(self, features) -> list[str]:
+        self.features = list(MODEL_FEATURES if features is None else features)
+        return self.features
+
+    @property
+    def feats(self) -> list[str]:
+        # Pickles from before feature groups have no attribute; they were fit on the base list.
+        return self.__dict__.get("features", BASE_FEATURES)
+
+    def fit(self, df: pd.DataFrame, features=None) -> "Model":
         raise NotImplementedError
 
     def pmf(self, df: pd.DataFrame) -> np.ndarray:
@@ -135,7 +143,8 @@ class NaiveNB(Model):
     """C0: mean = trailing EWM rebounds, one global NB alpha. The bar to clear."""
     name = "c0_naive_nb"
 
-    def fit(self, df):
+    def fit(self, df, features=None):
+        self._use(features)
         mu = df["reb_ewm"].fillna(df["REB"].mean()).values
         self.alpha = fit_nb_alpha(df["REB"].values, mu)
         self.fill = float(df["REB"].mean())
@@ -150,18 +159,19 @@ class LegacyMAENB(Model):
     in-sample residual variance. Kept to measure what the fixes are worth."""
     name = "c1_legacy_mae_nb"
 
-    def fit(self, df):
+    def fit(self, df, features=None):
+        f = self._use(features)
         params = {**XGB_BASE, "objective": "reg:absoluteerror"}
         params.pop("early_stopping_rounds")
         params["n_estimators"] = 1000
         params["learning_rate"] = 0.02
-        self.m = xgb.XGBRegressor(**params).fit(df[MODEL_FEATURES], df["REB"], verbose=False)
-        resid = df["REB"].values - self.m.predict(df[MODEL_FEATURES])
+        self.m = xgb.XGBRegressor(**params).fit(df[f], df["REB"], verbose=False)
+        resid = df["REB"].values - self.m.predict(df[f])
         self.var = float(resid.var())
         return self
 
     def pmf(self, df):
-        mu = np.maximum(self.m.predict(df[MODEL_FEATURES]), 0.01)
+        mu = np.maximum(self.m.predict(df[self.feats]), 0.01)
         # probability_engine._nb_params: var = max(global_var, mu+eps); alpha = (var-mu)/mu^2
         var = np.maximum(self.var, mu + 1e-6)
         return nb_pmf(mu, (var - mu) / mu ** 2)
@@ -171,27 +181,29 @@ class XGBPoisson(Model):
     """C2: XGB count:poisson mean, Poisson PMF."""
     name = "c2_xgb_poisson"
 
-    def fit(self, df):
+    def fit(self, df, features=None):
+        f = self._use(features)
         tr, ca = _split(df)
-        _, self.m = _xgb_fit("count:poisson", tr, ca, df)
+        _, self.m = _xgb_fit("count:poisson", tr, ca, df, f)
         return self
 
     def pmf(self, df):
-        return poisson_pmf(self.m.predict(df[MODEL_FEATURES]))
+        return poisson_pmf(self.m.predict(df[self.feats]))
 
 
 class XGBNB(Model):
     """C3: XGB Poisson-objective mean + NB alpha fit by MLE on held-out predictions."""
     name = "c3_xgb_nb"
 
-    def fit(self, df):
+    def fit(self, df, features=None):
+        f = self._use(features)
         tr, ca = _split(df)
-        ho, self.m = _xgb_fit("count:poisson", tr, ca, df)
-        self.alpha = fit_nb_alpha(ca["REB"].values, ho.predict(ca[MODEL_FEATURES]))
+        ho, self.m = _xgb_fit("count:poisson", tr, ca, df, f)
+        self.alpha = fit_nb_alpha(ca["REB"].values, ho.predict(ca[f]))
         return self
 
     def pmf(self, df):
-        return nb_pmf(self.m.predict(df[MODEL_FEATURES]), self.alpha)
+        return nb_pmf(self.m.predict(df[self.feats]), self.alpha)
 
 
 DISP_FEATURES = ["min_cv", "reb_cv", "exp_margin_abs", "vacuum_min", "is_playoffs", "is_b2b", "log_mu"]
@@ -214,10 +226,11 @@ class XGBNBHetero(Model):
     """C4: XGB mean + NB with log(alpha) linear in volatility/context features (MLE on holdout)."""
     name = "c4_xgb_nb_hetero"
 
-    def fit(self, df):
+    def fit(self, df, features=None):
+        f = self._use(features)
         tr, ca = _split(df)
-        ho, self.m = _xgb_fit("count:poisson", tr, ca, df)
-        mu = np.maximum(ho.predict(ca[MODEL_FEATURES]), 1e-3)
+        ho, self.m = _xgb_fit("count:poisson", tr, ca, df, f)
+        mu = np.maximum(ho.predict(ca[f]), 1e-3)
         Z, y = _disp_X(ca, mu), ca["REB"].values
         a0 = math.log(fit_nb_alpha(y, mu))
         x0 = np.zeros(Z.shape[1]); x0[0] = a0
@@ -226,7 +239,7 @@ class XGBNBHetero(Model):
         return self
 
     def pmf(self, df):
-        mu = np.maximum(self.m.predict(df[MODEL_FEATURES]), 1e-3)
+        mu = np.maximum(self.m.predict(df[self.feats]), 1e-3)
         return nb_pmf(mu, np.exp(np.clip(_disp_X(df, mu) @ self.beta, -9, 3)))
 
 
@@ -240,29 +253,30 @@ class MinutesRate(Model):
     N_Q = 25
     BINS = np.array([0, 20, 26, 32, 48])
 
-    def fit(self, df):
+    def fit(self, df, features=None):
+        f = self._use(features)
         df = df.assign(log_min=np.log(np.maximum(pd.to_numeric(df["MIN"], errors="coerce").fillna(0), 0.5)))
         tr, ca = _split(df)
-        ho_m, self.m_min = _xgb_fit("reg:squarederror", tr, ca, df, target="MIN")
-        pred_ca = ho_m.predict(ca[MODEL_FEATURES])
+        ho_m, self.m_min = _xgb_fit("reg:squarederror", tr, ca, df, f, target="MIN")
+        pred_ca = ho_m.predict(ca[f])
         resid = ca["MIN"].values - pred_ca
         qs = (np.arange(self.N_Q) + 0.5) / self.N_Q
         b = np.digitize(pred_ca, self.BINS[1:-1])
         self.resid_q = np.vstack([np.quantile(resid[b == i] if (b == i).sum() > 200 else resid, qs)
                                   for i in range(len(self.BINS) - 1)])
         pos_tr, pos_ca, pos = tr[tr["MIN"] > 0], ca[ca["MIN"] > 0], df[df["MIN"] > 0]
-        ho_r, self.m_rate = _xgb_fit("count:poisson", pos_tr, pos_ca, pos, margin="log_min")
-        rate_ca = ho_r.predict(pos_ca[MODEL_FEATURES], base_margin=np.zeros(len(pos_ca)))
+        ho_r, self.m_rate = _xgb_fit("count:poisson", pos_tr, pos_ca, pos, f, margin="log_min")
+        rate_ca = ho_r.predict(pos_ca[f], base_margin=np.zeros(len(pos_ca)))
         self.alpha = fit_nb_alpha(pos_ca["REB"].values, rate_ca * pos_ca["MIN"].values)
         return self
 
     def minutes_grid(self, df) -> np.ndarray:
-        mu_m = self.m_min.predict(df[MODEL_FEATURES])
+        mu_m = self.m_min.predict(df[self.feats])
         b = np.digitize(mu_m, self.BINS[1:-1])
         return np.clip(mu_m[:, None] + self.resid_q[b], 0.0, 53.0)   # (n, N_Q)
 
     def pmf(self, df):
-        rate = self.m_rate.predict(df[MODEL_FEATURES], base_margin=np.zeros(len(df)))
+        rate = self.m_rate.predict(df[self.feats], base_margin=np.zeros(len(df)))
         mins = self.minutes_grid(df)
         out = np.zeros((len(df), TOP + 1))
         for q in range(self.N_Q):
@@ -277,19 +291,20 @@ class LGBMulticlass(Model):
                   min_data_in_leaf=100, feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
                   lambda_l2=5.0, verbose=-1, seed=42)
 
-    def fit(self, df):
+    def fit(self, df, features=None):
+        f = self._use(features)
         tr, ca = _split(df)
         yc = lambda d: np.minimum(d["REB"].values, TOP).astype(int)
-        dtr = lgb.Dataset(tr[MODEL_FEATURES], yc(tr))
-        dca = lgb.Dataset(ca[MODEL_FEATURES], yc(ca), reference=dtr)
+        dtr = lgb.Dataset(tr[f], yc(tr))
+        dca = lgb.Dataset(ca[f], yc(ca), reference=dtr)
         ho = lgb.train(self.PARAMS, dtr, 2000, valid_sets=[dca],
                        callbacks=[lgb.early_stopping(50, verbose=False)])
         rounds = max(50, int(ho.best_iteration * 1.1))
-        self.m = lgb.train(self.PARAMS, lgb.Dataset(df[MODEL_FEATURES], yc(df)), rounds)
+        self.m = lgb.train(self.PARAMS, lgb.Dataset(df[f], yc(df)), rounds)
         return self
 
     def pmf(self, df):
-        p = self.m.predict(df[MODEL_FEATURES])
+        p = self.m.predict(df[self.feats])
         return p / p.sum(axis=1, keepdims=True)
 
 
@@ -299,8 +314,9 @@ class Ensemble45(Model):
     -0.0007 vs C5 and -0.0008 vs C4 (date-clustered bootstrap CIs exclude 0)."""
     name = "c7_ens_c4_c5"
 
-    def fit(self, df):
-        self.parts = [XGBNBHetero().fit(df), MinutesRate().fit(df)]
+    def fit(self, df, features=None):
+        f = self._use(features)
+        self.parts = [XGBNBHetero().fit(df, f), MinutesRate().fit(df, f)]
         return self
 
     def pmf(self, df):
