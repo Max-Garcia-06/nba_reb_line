@@ -391,6 +391,7 @@ def build_feature_table(
     tracking_daily: Optional[pd.DataFrame] = None,
     starters: Optional[pd.DataFrame] = None,
     live_starters: Optional[dict[str, set[int]]] = None,
+    pregame_inactive: Optional[dict[tuple[str, int], set[int]]] = None,
 ) -> pd.DataFrame:
     """
     Parameters
@@ -415,6 +416,9 @@ def build_feature_table(
                       (default: the starters table when gamelogs come from SQLite).
     live_starters   : {GAME_ID: {PLAYER_ID}} confirmed starters for extra_rows games; a game
                       missing here gets NaN lineup features.
+    pregame_inactive: {(GAME_ID, TEAM_ID): {PLAYER_ID}} on the lineups JSON Inactive list
+                      before the decision time; the inactive group adds them to pregame_out
+                      (default: lineups.pregame_inactive() when gamelogs come from SQLite).
     """
     groups = ENABLED_GROUPS if groups is None else sorted(set(groups))
     feature_cols = model_features(groups)
@@ -513,6 +517,15 @@ def build_feature_table(
         from injury_reports import pregame_out_for_gamelogs
 
         pregame_out = pregame_out_for_gamelogs(gl)
+    if "inactive" in groups:
+        if pregame_inactive is None and gamelogs is None:
+            from lineups import pregame_inactive as _load_inactive
+
+            pregame_inactive = _load_inactive()
+        merged = {k: set(v) for k, v in (pregame_out or {}).items()}
+        for k, v in (pregame_inactive or {}).items():
+            merged.setdefault(k, set()).update(v)
+        pregame_out = merged
     # Vacuum for every team-game in the slate, including opponents that have no target rows
     # (live: an opponent without Kalshi markets) so opp_vacuum is defined for them too.
     vac_targets = df[["TEAM_ID", "GAME_ID", "GAME_DATE", "SEASON", "_live"]]

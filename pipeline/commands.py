@@ -113,6 +113,18 @@ def starters_backfill(
     _success(f"Stored {nba_daily.backfill_starters(start, end, refetch=refetch):,} rows in {nba_daily.STARTERS_TABLE}.")
 
 
+def lineups_backfill(
+    start: str = typer.Option(..., "--start", help="First game date YYYY-MM-DD."),
+    end: str = typer.Option(..., "--end", help="Last game date YYYY-MM-DD."),
+    refetch: bool = typer.Option(False, "--refetch", help="Re-download dates already stored."),
+):
+    """NBA daily lineups JSON (confirmed starters, Inactive list) into the lineups table."""
+    import lineups
+
+    _header(f"Lineups backfill — {start} → {end}")
+    _success(f"Stored {lineups.backfill(start, end, refetch=refetch):,} rows in {lineups.TABLE}.")
+
+
 def train():
     _header("Phase 2 — Model Training")
     import model as m
