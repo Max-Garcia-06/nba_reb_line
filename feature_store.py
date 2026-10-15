@@ -405,11 +405,23 @@ def build_feature_table(
         from injury_reports import pregame_out_for_gamelogs
 
         pregame_out = pregame_out_for_gamelogs(gl)
-    vac = teammate_vacuum(df, pstate, pool, played, absent_override, pregame_out=pregame_out,
+    # Vacuum for every team-game in the slate, including opponents that have no target rows
+    # (live: an opponent without Kalshi markets) so opp_vacuum is defined for them too.
+    vac_targets = df[["TEAM_ID", "GAME_ID", "GAME_DATE", "SEASON", "_live"]]
+    if "opp_vacuum" in groups:
+        vac_targets = pd.concat([vac_targets, df[["OPP_TEAM_ID", "GAME_ID", "GAME_DATE", "SEASON", "_live"]]
+                                 .rename(columns={"OPP_TEAM_ID": "TEAM_ID"})], ignore_index=True)
+    vac = teammate_vacuum(vac_targets, pstate, pool, played, absent_override, pregame_out=pregame_out,
                           appearances=gl[["PLAYER_ID", "GAME_DATE", "TEAM_ID"]], current_team=current_team)
     df = df.merge(vac, on=["TEAM_ID", "GAME_ID"], how="left")
     for c in ("vacuum_reb", "vacuum_min", "vacuum_n"):
         df[c] = df[c].fillna(0.0)
+    if "opp_vacuum" in groups:
+        ov = vac.rename(columns={"TEAM_ID": "OPP_TEAM_ID", "vacuum_reb": "opp_vacuum_reb",
+                                 "vacuum_min": "opp_vacuum_min", "vacuum_n": "opp_vacuum_n"})
+        df = df.merge(ov, on=["OPP_TEAM_ID", "GAME_ID"], how="left")
+        for c in FEATURE_GROUPS["opp_vacuum"]:
+            df[c] = df[c].fillna(0.0)
 
     # An enabled group whose source data is missing yields NaN columns, not a KeyError.
     for c in feature_cols:
