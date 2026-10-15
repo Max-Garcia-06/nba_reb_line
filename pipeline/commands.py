@@ -101,6 +101,18 @@ def tracking_backfill(
     _success(f"Stored {nba_daily.backfill_tracking(start, end, refetch=refetch):,} rows in {nba_daily.TRACKING_TABLE}.")
 
 
+def starters_backfill(
+    start: str = typer.Option(..., "--start", help="First game date YYYY-MM-DD."),
+    end: str = typer.Option(..., "--end", help="Last game date YYYY-MM-DD."),
+    refetch: bool = typer.Option(False, "--refetch", help="Re-download dates already stored."),
+):
+    """Box-score starters (one nba_api call per game date) into the starters table."""
+    import nba_daily
+
+    _header(f"Starters backfill — {start} → {end}")
+    _success(f"Stored {nba_daily.backfill_starters(start, end, refetch=refetch):,} rows in {nba_daily.STARTERS_TABLE}.")
+
+
 def train():
     _header("Phase 2 — Model Training")
     import model as m

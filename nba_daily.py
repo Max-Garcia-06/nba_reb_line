@@ -13,7 +13,7 @@ A player plays at most one game per date, so (PLAYER_ID, GAME_DATE) is the key.
 from __future__ import annotations
 
 import pandas as pd
-from nba_api.stats.endpoints import leaguedashptstats
+from nba_api.stats.endpoints import leaguedashplayerstats, leaguedashptstats
 from sqlalchemy import inspect
 
 import daily_store
@@ -43,6 +43,24 @@ def backfill_tracking(start: str, end: str, engine=None, refetch: bool = False) 
                                     key=TRACKING_KEY, start=start, end=end, fetch=fetch_tracking_day,
                                     refetch=refetch)
 
+
+STARTERS_TABLE = "starters"
+STARTERS_KEY = ["PLAYER_ID", "GAME_DATE"]
+
+
+def fetch_starters_day(date: str, season: str, season_type: str) -> pd.DataFrame:
+    df = de._call(leaguedashplayerstats.LeagueDashPlayerStats, season=season, season_type_all_star=season_type,
+                  starter_bench_nullable="Starters", per_mode_detailed="Totals",
+                  date_from_nullable=_mdy(date), date_to_nullable=_mdy(date))[0]
+    out = df[["PLAYER_ID", "TEAM_ID"]].copy()
+    out["GAME_DATE"], out["SEASON"] = date, season
+    return out
+
+
+def backfill_starters(start: str, end: str, engine=None, refetch: bool = False) -> int:
+    return daily_store.run_backfill(engine or de._get_engine(), source="starters", table=STARTERS_TABLE,
+                                    key=STARTERS_KEY, start=start, end=end, fetch=fetch_starters_day,
+                                    refetch=refetch)
 
 def load_table(table: str, engine=None) -> pd.DataFrame:
     engine = engine or de._get_engine()

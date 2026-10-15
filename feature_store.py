@@ -232,6 +232,59 @@ def tracking_state(td: pd.DataFrame, window: int = ROLLING_WINDOW) -> pd.DataFra
     return st
 
 
+USUAL_STARTER_GAMES = 10
+
+
+def lineup_features(df: pd.DataFrame, gl: pd.DataFrame, starters: pd.DataFrame,
+                    live_starters: Optional[dict[str, set[int]]], window: int = ROLLING_WINDOW) -> pd.DataFrame:
+    """
+    starts_tonight           1/0 if tonight's starter (history: box-score starters; live: confirmed
+                             lineup), NaN when unknown (date not backfilled / lineup unconfirmed)
+    start_rate_roll          share of the player's last ``window`` games started (strictly before)
+    role_change              starts_tonight − start_rate_roll
+    team_usual_starters_out  of the team's 5 most frequent starters over its previous 10 games,
+                             how many are not starting tonight
+    """
+    st = starters.copy()
+    st["GAME_DATE"] = pd.to_datetime(st["GAME_DATE"]).dt.normalize()
+    st["PLAYER_ID"], st["TEAM_ID"] = st["PLAYER_ID"].astype(int), st["TEAM_ID"].astype(int)
+    covered = set(st["GAME_DATE"])
+    started = set(zip(st["PLAYER_ID"], st["GAME_DATE"]))
+
+    hist = gl[["PLAYER_ID", "GAME_DATE"]].sort_values(["PLAYER_ID", "GAME_DATE"]).reset_index(drop=True)
+    hist["_started"] = [float((p, d) in started) if d in covered else np.nan
+                        for p, d in zip(hist["PLAYER_ID"], hist["GAME_DATE"])]
+    hist["start_rate_roll"] = hist.groupby("PLAYER_ID")["_started"].transform(
+        lambda x: x.rolling(window, min_periods=3).mean())
+    out = _asof(df[["PLAYER_ID", "GAME_DATE"]], hist[["PLAYER_ID", "GAME_DATE", "start_rate_roll"]], by="PLAYER_ID")
+    out = out[["start_rate_roll"]].copy()
+
+    live_starters = live_starters or {}
+    by_team = {t: g.groupby("GAME_DATE")["PLAYER_ID"].agg(set).sort_index() for t, g in st.groupby("TEAM_ID")}
+
+    def tonight(pid_team, gid, date, live):
+        if live:
+            return live_starters.get(str(gid))
+        s = by_team.get(pid_team)
+        return s.get(date) if s is not None and date in covered else None
+
+    starts, usual_out = [], {}
+    for pid, tid, gid, date, live in zip(df["PLAYER_ID"], df["TEAM_ID"], df["GAME_ID"], df["GAME_DATE"], df["_live"]):
+        tn = tonight(int(tid), gid, date, live)
+        starts.append(np.nan if tn is None else float(int(pid) in tn))
+        key = (int(tid), str(gid))
+        if key not in usual_out:
+            s = by_team.get(int(tid))
+            prev = s[s.index < date].iloc[-USUAL_STARTER_GAMES:] if s is not None else []
+            counts = pd.Series([p for ps in prev for p in ps], dtype="int64").value_counts(sort=False)
+            usual = set(counts.sort_values(ascending=False, kind="stable").index[:5]) if len(counts) else set()
+            usual_out[key] = np.nan if tn is None or not usual else float(len(usual - set(tn)))
+    out["starts_tonight"] = starts
+    out["team_usual_starters_out"] = [usual_out[(int(t), str(g))] for t, g in zip(df["TEAM_ID"], df["GAME_ID"])]
+    out["role_change"] = out["starts_tonight"] - out["start_rate_roll"]
+    return out[FEATURE_GROUPS["lineup"]].set_index(df.index)
+
+
 # ---------------------------------------------------------------------------
 # As-of joins
 # ---------------------------------------------------------------------------
@@ -336,6 +389,8 @@ def build_feature_table(
     groups: Optional[list[str]] = None,
     schedule: Optional[pd.DataFrame] = None,
     tracking_daily: Optional[pd.DataFrame] = None,
+    starters: Optional[pd.DataFrame] = None,
+    live_starters: Optional[dict[str, set[int]]] = None,
 ) -> pd.DataFrame:
     """
     Parameters
@@ -356,6 +411,10 @@ def build_feature_table(
                       gamelogs come from SQLite.
     tracking_daily  : per-game rebound tracking for the tracking group (default: the
                       tracking_daily table when gamelogs come from SQLite).
+    starters        : box-score starters (PLAYER_ID, TEAM_ID, GAME_DATE) for the lineup group
+                      (default: the starters table when gamelogs come from SQLite).
+    live_starters   : {GAME_ID: {PLAYER_ID}} confirmed starters for extra_rows games; a game
+                      missing here gets NaN lineup features.
     """
     groups = ENABLED_GROUPS if groups is None else sorted(set(groups))
     feature_cols = model_features(groups)
@@ -400,6 +459,16 @@ def build_feature_table(
             tracking_daily = load_table(TRACKING_TABLE)
         if tracking_daily is not None and len(tracking_daily):
             df = _asof(df, tracking_state(tracking_daily), by="PLAYER_ID")
+
+    if "lineup" in groups:
+        if starters is None and gamelogs is None:
+            from nba_daily import STARTERS_TABLE, load_table
+
+            starters = load_table(STARTERS_TABLE)
+        if starters is not None and len(starters):
+            lf = lineup_features(df, gl, starters, live_starters)
+            for c in lf.columns:
+                df[c] = lf[c].values
 
     # Prior-season tracking + REB/G
     prev = trk.copy()
