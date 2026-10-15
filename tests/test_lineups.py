@@ -72,3 +72,27 @@ def test_inactive_group_adds_listed_players_to_vacuum():
     b = base[(base["GAME_ID"] == gid) & (base["TEAM_ID"] == team)]["vacuum_n"].iloc[0]
     w = with_inactive[(with_inactive["GAME_ID"] == gid) & (with_inactive["TEAM_ID"] == team)]["vacuum_n"].iloc[0]
     assert w == b + 1
+
+
+def test_pregame_inactive_parses_mixed_iso_timestamps(tmp_path):
+    eng = create_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
+    pd.DataFrame([{"GAME_ID": "0022500936", "TIP_UTC": "2026-03-10T23:00:00Z", "GAME_DATE_EST": "2026-03-10"},
+                  {"GAME_ID": "0022500937", "TIP_UTC": "2026-03-10T23:30:00Z", "GAME_DATE_EST": "2026-03-10"}]
+                 ).to_sql("schedule", eng, index=False)
+    a = lu.parse_lineups(FULL, "2026-03-10")                                        # naive stamps first
+    b = lu.parse_lineups(_payload([_p(8, 1, roster="Inactive", ts="2026-03-10T22:50:00.123Z")], [],
+                                  gid="0022500937"), "2026-03-10")                   # before T-30, other format
+    pd.concat([a, b]).to_sql(lu.TABLE, eng, index=False)
+    assert lu.pregame_inactive(eng, lead_min=30)[("0022500937", 1)] == {8}
+
+
+def test_backfill_leaves_recent_empty_files_undone(tmp_path, monkeypatch):
+    import daily_store as ds
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
+    pd.DataFrame({"GAME_ID": ["0022400001", "0022600001"], "SEASON": ["2024-25", "2026-27"],
+                  "GAME_DATE_EST": ["2024-11-05", "2026-10-25"]}).to_sql("schedule", eng, index=False)
+    monkeypatch.setattr("data_engine._today_et", lambda: "2026-10-27")
+    monkeypatch.setattr(lu, "fetch_day", lambda d, session=None: lu.parse_lineups({"games": []}, d))
+    lu.backfill("2024-10-01", "2026-12-31", engine=eng)
+    assert ds.done_dates(eng, "lineups") == {"2024-11-05"}  # old empty file is final; a recent one may be a glitch

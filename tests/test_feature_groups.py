@@ -93,3 +93,33 @@ def test_group_data_lag_days(tmp_path):
     pd.DataFrame({"GAME_DATE": ["2026-03-01"]}).to_sql("tracking_daily", eng, index=False)
     lags = cp.group_data_lag_days(eng, today="2026-03-06", groups=["tracking", "lineup", "travel"])
     assert lags == {"tracking": 4, "lineup": None}
+
+
+def test_model_meta_records_feature_version():
+    import model
+
+    _, meta = model._fit(_train_frame(), "c4_xgb_nb_hetero")
+    assert meta["feature_version"] == fs.FEATURE_VERSION
+
+
+def test_preflight_flags_feature_version_mismatch_without_new_columns(monkeypatch):
+    """`inactive` adds no columns: only the version tells a base model from an inactive one."""
+    import calibrate_preflight as cp
+
+    monkeypatch.setattr(cp, "_model_feature_version", lambda: "v3-lead30-base")
+    monkeypatch.setattr(fs, "FEATURE_VERSION", "v3-lead30-inactive")
+    res = cp.check_calibrate_preflight(live=True)
+    assert any("v3-lead30-inactive" in e for e in res.errors)
+
+
+def test_legacy_meta_counts_as_base_version(tmp_path, monkeypatch):
+    import pickle
+
+    import calibrate_preflight as cp
+    import model
+
+    monkeypatch.undo()  # conftest stubs _model_feature_version; read a real meta file here
+    p = tmp_path / "meta.pkl"
+    p.write_bytes(pickle.dumps({"features": fs.BASE_FEATURES}))
+    monkeypatch.setattr(model, "META_PATH", p)
+    assert cp._model_feature_version() == fs.feature_version([], fs.DECISION_LEAD_MIN)

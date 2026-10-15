@@ -62,3 +62,21 @@ def test_store_day_replaces_rows_for_date(eng):
     ds.store_day(eng, table="zt", source="z", date="2025-10-21",
                  df=pd.DataFrame({"PLAYER_ID": [9], "GAME_DATE": ["2025-10-21"], "STYPE": ["r"]}), key=key)
     assert pd.read_sql("SELECT PLAYER_ID FROM zt", eng)["PLAYER_ID"].tolist() == [9]
+
+
+def test_store_day_moves_rows_whose_key_reappears_on_another_date(eng):
+    """A postponed game is listed in two date files: the later write wins, no duplicate keys."""
+    key = ["GAME_ID", "PLAYER_ID"]
+    row = lambda d: pd.DataFrame({"GAME_ID": ["g1"], "PLAYER_ID": [7], "GAME_DATE": [d]})
+    ds.store_day(eng, table="lt", source="l", date="2026-01-24", df=row("2026-01-24"), key=key)
+    ds.store_day(eng, table="lt", source="l", date="2026-01-25", df=row("2026-01-25"), key=key)
+    assert pd.read_sql("SELECT GAME_DATE FROM lt", eng)["GAME_DATE"].tolist() == ["2026-01-25"]
+
+
+def test_allow_empty_can_depend_on_date(eng):
+    def fetch(d, s, t):
+        return pd.DataFrame(columns=["PLAYER_ID", "GAME_DATE"])
+
+    ds.run_backfill(eng, source="e", table="et", key=["PLAYER_ID", "GAME_DATE"], start="2025-10-01",
+                    end="2026-12-31", fetch=fetch, allow_empty=lambda d: d < "2026-01-01")
+    assert ds.done_dates(eng, "e") == {"2025-10-21"}

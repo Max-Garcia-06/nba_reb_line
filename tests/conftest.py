@@ -15,6 +15,7 @@ def _no_real_model_lag(monkeypatch, tmp_path):
     monkeypatch.setattr("calibrate_preflight._latest_game_date", lambda: "2026-06-13")
     monkeypatch.setattr("calibrate_preflight._model_data_end", lambda: "2026-06-13")
     monkeypatch.setattr("calibrate_preflight._model_features", lambda: None)
+    monkeypatch.setattr("calibrate_preflight._model_feature_version", lambda: None)
     monkeypatch.setattr("calibrate_preflight._latest_completed_scheduled_date", lambda: None)
     monkeypatch.setattr("calibrate_preflight.BLEND_META_PATH", tmp_path / "_no_blend_meta.json")
     monkeypatch.setattr("calibrate_preflight.SEGMENT_BLEND_META_PATH", tmp_path / "_no_blend_seg.json")

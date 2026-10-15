@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 from config import EVAL_LINES, MODEL_DIR, MODEL_FAMILY
-from feature_store import MODEL_FEATURES, build_feature_table
+from feature_store import FEATURE_VERSION, MODEL_FEATURES, build_feature_table
 from model_zoo import CANDIDATES, Model, TOP, prob_over
 
 log = logging.getLogger(__name__)
@@ -68,6 +68,8 @@ def _fit(dff: pd.DataFrame, family: str) -> tuple[Model, dict]:
     meta = {
         "family": family,
         "features": list(MODEL_FEATURES),
+        # Groups + decision lead: `inactive` and DECISION_LEAD_MIN change features without new columns.
+        "feature_version": FEATURE_VERSION,
         "train_rows": int(len(dff)),
         "data_start": str(pd.to_datetime(dff["GAME_DATE"]).min().date()),
         "data_end": str(pd.to_datetime(dff["GAME_DATE"]).max().date()),

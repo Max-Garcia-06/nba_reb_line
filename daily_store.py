@@ -46,10 +46,17 @@ def completed_game_dates(engine, start: str, end: str) -> list[tuple[str, str, s
 
 def store_day(engine, *, table: str, source: str, date: str, df: pd.DataFrame, key: list[str],
               date_col: str = "GAME_DATE") -> int:
-    """Replace ``table`` rows for ``date`` with ``df`` and mark (source, date) done, atomically."""
+    """Replace ``table`` rows for ``date`` with ``df`` and mark (source, date) done, atomically.
+    Rows elsewhere with the same ``key`` (a postponed game listed again on its new date) are
+    replaced too, so the key stays unique."""
     with engine.begin() as conn:
         if inspect(conn).has_table(table):
             conn.execute(text(f"DELETE FROM {table} WHERE {date_col} = :d"), {"d": date})
+            if len(df):
+                df[key].drop_duplicates().to_sql("_store_day_keys", conn, if_exists="replace", index=False)
+                cols = ", ".join(key)
+                conn.execute(text(f"DELETE FROM {table} WHERE ({cols}) IN (SELECT {cols} FROM _store_day_keys)"))
+                conn.execute(text("DROP TABLE _store_day_keys"))
         if len(df):
             df.to_sql(table, conn, if_exists="append", index=False)
         if inspect(conn).has_table(DONE_TABLE):
@@ -62,7 +69,8 @@ def store_day(engine, *, table: str, source: str, date: str, df: pd.DataFrame, k
 
 def run_backfill(engine, *, source: str, table: str, key: list[str], start: str, end: str,
                  fetch: Callable[[str, str, str], pd.DataFrame], refetch: bool = False,
-                 allow_empty: bool = False, date_col: str = "GAME_DATE") -> int:
+                 allow_empty: bool | Callable[[str], bool] = False, date_col: str = "GAME_DATE") -> int:
+    """``allow_empty``: mark empty dates done (bool), or a predicate on the date."""
     done = set() if refetch else done_dates(engine, source)
     parts: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for date, season, stype in completed_game_dates(engine, start, end):
@@ -77,7 +85,7 @@ def run_backfill(engine, *, source: str, table: str, key: list[str], start: str,
             log.warning(f"[{source}] {date} failed: {e}")
             continue
         df = df.drop_duplicates(subset=key, keep="last") if len(df) else df
-        if df.empty and not allow_empty:
+        if df.empty and not (allow_empty(date) if callable(allow_empty) else allow_empty):
             log.warning(f"[{source}] {date} returned no rows; leaving it undone")
             continue
         n += store_day(engine, table=table, source=source, date=date, df=df, key=key, date_col=date_col)

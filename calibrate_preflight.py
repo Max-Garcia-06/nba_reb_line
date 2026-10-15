@@ -118,6 +118,23 @@ def _model_features() -> list[str] | None:
         return None
 
 
+def _model_feature_version() -> str | None:
+    """FEATURE_VERSION the model was trained under; metas from before it was recorded count
+    as the base set at the current decision lead. None when no meta can be read."""
+    import pickle
+
+    from config import DECISION_LEAD_MIN
+    from feature_store import feature_version
+    from model import META_PATH
+
+    try:
+        with open(META_PATH, "rb") as f:
+            meta = pickle.load(f)
+    except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+        return None
+    return meta.get("feature_version") or feature_version([], DECISION_LEAD_MIN)
+
+
 def _latest_game_date() -> str | None:
     from sqlalchemy import text
 
@@ -231,12 +248,16 @@ def check_calibrate_preflight(*, live: bool = False) -> CalibratePreflightResult
                 f"limit {MODEL_MAX_DATA_LAG_DAYS}d); run train"
             )
 
-    from feature_store import ENABLED_GROUPS, MODEL_FEATURES
+    import feature_store as fs
 
     trained_feats = _model_features()
-    if trained_feats is not None and list(trained_feats) != list(MODEL_FEATURES):
+    trained_version = _model_feature_version()
+    if trained_feats is not None and list(trained_feats) != list(fs.MODEL_FEATURES):
         _flag(f"Model was trained on a different feature set ({len(trained_feats)} features) than "
-              f"FEATURE_GROUPS={ENABLED_GROUPS} ({len(MODEL_FEATURES)} features); run train")
+              f"FEATURE_GROUPS={fs.ENABLED_GROUPS} ({len(fs.MODEL_FEATURES)} features); run train")
+    elif trained_version is not None and trained_version != fs.FEATURE_VERSION:
+        _flag(f"Model was trained under feature version {trained_version}, current is {fs.FEATURE_VERSION} "
+              f"(FEATURE_GROUPS / DECISION_LEAD_MIN changed); run train")
 
     # The model-lag gate compares the model with the DB; if the nightly ETL stopped,
     # both are stale together. Gate the DB on the schedule: last night's games must be in.

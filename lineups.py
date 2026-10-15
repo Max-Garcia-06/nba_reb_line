@@ -30,6 +30,9 @@ URL = "https://stats.nba.com/js/data/leaders/00_daily_lineups_{ymd}.json"
 HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.nba.com/"}
 TABLE = "lineups"
 KEY = ["GAME_ID", "PLAYER_ID"]
+# An empty file this old is final (2024-25 has no lineup data); a newer one may be a CDN
+# glitch or not yet populated, so it stays undone and the nightly lookback retries it.
+EMPTY_FINAL_DAYS = 7
 COLS = ["GAME_DATE", "GAME_ID", "TEAM_ID", "PLAYER_ID", "PLAYER_NAME", "lineup_status", "roster_status",
         "position", "ts_utc"]
 
@@ -64,9 +67,10 @@ def fetch_day(game_date: str, session=None) -> pd.DataFrame:
 
 
 def backfill(start: str, end: str, engine=None, refetch: bool = False) -> int:
+    final_before = (pd.Timestamp(de._today_et()) - pd.Timedelta(days=EMPTY_FINAL_DAYS)).strftime("%Y-%m-%d")
     return daily_store.run_backfill(engine or de._get_engine(), source="lineups", table=TABLE, key=KEY,
                                     start=start, end=end, fetch=lambda d, s, t: fetch_day(d),
-                                    refetch=refetch, allow_empty=True)
+                                    refetch=refetch, allow_empty=lambda d: d < final_before)
 
 
 def lineup_states(df: pd.DataFrame) -> dict[str, GameLineup]:
@@ -105,8 +109,9 @@ def pregame_inactive(engine=None, lead_min: int | None = None) -> dict[tuple[str
     lu = pd.read_sql(text(f"SELECT GAME_ID, TEAM_ID, PLAYER_ID, roster_status, ts_utc FROM {TABLE}"), engine)
     sch = pd.read_sql(text("SELECT GAME_ID, TIP_UTC FROM schedule"), engine)
     lu = lu.merge(sch, on="GAME_ID")
-    tip = pd.to_datetime(lu["TIP_UTC"], utc=True, errors="coerce")
-    ts = pd.to_datetime(lu["ts_utc"], utc=True, errors="coerce")
+    # ISO8601: per-element parsing; an inferred format would turn other ISO variants into NaT.
+    tip = pd.to_datetime(lu["TIP_UTC"], utc=True, errors="coerce", format="ISO8601")
+    ts = pd.to_datetime(lu["ts_utc"], utc=True, errors="coerce", format="ISO8601")
     lu = lu[ts.notna() & tip.notna() & (ts <= tip - pd.Timedelta(minutes=lead))]
     out: dict[tuple[str, int], set[int]] = {}
     for (gid, tid), g in lu.groupby(["GAME_ID", "TEAM_ID"]):
