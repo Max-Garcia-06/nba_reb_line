@@ -31,7 +31,7 @@ import pandas as pd
 import requests
 from sqlalchemy import text
 
-from config import DATA_DIR
+from config import DATA_DIR, DECISION_LEAD_MIN
 
 log = logging.getLogger(__name__)
 
@@ -324,13 +324,17 @@ def pregame_out_by_game(
     return out
 
 
-def pregame_out_for_gamelogs(gl: pd.DataFrame, *, lead_min: int = 60, engine=None) -> dict[tuple[str, int], set[int]]:
+def pregame_out_for_gamelogs(gl: pd.DataFrame, *, lead_min: int | None = None,
+                             engine=None) -> dict[tuple[str, int], set[int]]:
     """
     Knowable-before-tip absences for every scheduled game the stored reports cover:
     {(GAME_ID, TEAM_ID): {PLAYER_ID}} using the latest report at least ``lead_min``
-    before tip. Names resolve against everyone who has appeared for the team in ``gl``.
+    (default DECISION_LEAD_MIN) before tip. Names resolve against everyone who has
+    appeared for the team in ``gl``.
     """
     import data_engine as de
+
+    lead_min = DECISION_LEAD_MIN if lead_min is None else lead_min
 
     engine = engine or de._get_engine()
     try:

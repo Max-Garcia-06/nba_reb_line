@@ -8,6 +8,7 @@ import logging
 import statistics
 from collections import defaultdict
 from datetime import datetime
+from typing import Optional
 
 import typer
 from rich import box
@@ -74,13 +75,17 @@ def etl(
 def injury_backfill(
     start: str = typer.Option(..., "--start", help="First game date YYYY-MM-DD."),
     end: str = typer.Option(..., "--end", help="Last game date YYYY-MM-DD."),
-    lead_min: int = typer.Option(60, "--lead-min", help="Use the latest report at least this many minutes before tip."),
+    lead_min: Optional[int] = typer.Option(
+        None, "--lead-min", help="Use the latest report at least this many minutes before tip (default DECISION_LEAD_MIN)."),
 ):
     """Download and store official NBA injury reports for historical games (pre-tip knowable absences)."""
     import pandas as pd
 
     import injury_reports as ir
+    from config import DECISION_LEAD_MIN
     from data_engine import _get_engine
+
+    lead_min = DECISION_LEAD_MIN if lead_min is None else lead_min
 
     _header(f"Injury report backfill — {start} → {end}")
     eng = _get_engine()

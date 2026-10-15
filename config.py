@@ -151,7 +151,7 @@ ROLLING_WINDOW = 10
 
 # Minimum games for a player to include in training
 MIN_GAMES = 15
-# Historical teammate absences from official injury reports (as of tip − 60 min) where
+# Historical teammate absences from official injury reports (as of tip − DECISION_LEAD_MIN) where
 # the injury_reports table covers a game, instead of box-score hindsight.
 PREGAME_ABSENCES = os.getenv("PREGAME_ABSENCES", "true").lower() in ("1", "true", "yes")
 # Optional feature groups (feature_store.FEATURE_GROUPS), comma-separated, e.g.

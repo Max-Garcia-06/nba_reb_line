@@ -190,3 +190,21 @@ def test_fetch_falls_back_to_hourly_filename(tmp_path):
     s2 = _S()
     assert ir.fetch_report(datetime(2025, 11, 15, 17, 15), tmp_path, s2) is None
     assert len(s2.urls) == 1
+
+
+def test_pregame_out_default_lead_is_decision_lead(tmp_path, monkeypatch):
+    import injury_reports as ir
+    from sqlalchemy import create_engine
+
+    monkeypatch.setattr(ir, "DECISION_LEAD_MIN", 30)
+    eng = create_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
+    pd.DataFrame([{"GAME_ID": "0022500900", "GAME_DATE_EST": "2026-03-02", "TIP_UTC": "2026-03-03T00:00:00Z",
+                   "AWAY_TRICODE": "HOU", "HOME_TRICODE": "WAS", "AWAY_TEAM_ID": 10, "HOME_TEAM_ID": 20}]
+                 ).to_sql("schedule", eng, index=False)
+    ir.store_report(eng, datetime(2026, 3, 2, 18, 15), [  # T-45: inside a 30-min lead, outside 60
+        {"game_date": "2026-03-02", "game_time": "07:00", "matchup": "HOU@WAS", "team": "HOU",
+         "player_name": "Steven Adams", "status": "Out"}])
+    gl = pd.DataFrame({"PLAYER_ID": [1], "PLAYER_NAME": ["Steven Adams"], "TEAM_ID": [10],
+                       "GAME_ID": ["0022500800"], "GAME_DATE": pd.to_datetime(["2026-03-01"]), "SEASON": ["2025-26"]})
+    assert ir.pregame_out_for_gamelogs(gl, engine=eng)[("0022500900", 10)] == {1}
+    assert ir.pregame_out_for_gamelogs(gl, engine=eng, lead_min=60).get(("0022500900", 10), set()) == set()
