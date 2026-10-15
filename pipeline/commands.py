@@ -238,6 +238,7 @@ def scan(
         MAX_YES_LINE,
         MIN_LIMIT_PRICE,
         MIN_P,
+        SCAN_TIP_WINDOW_MIN,
         SCAN_WITHIN_HOURS,
         TAIL_P_CUTOFF,
         TAIL_EDGE_MULT,
@@ -340,19 +341,21 @@ def scan(
             _warn("No pre-game rebound markets left after excluding started games.")
             raise typer.Exit(0)
 
-        if SCAN_WITHIN_HOURS > 0:
+        window = SCAN_TIP_WINDOW_MIN or ((0.0, SCAN_WITHIN_HOURS * 60.0) if SCAN_WITHIN_HOURS > 0 else None)
+        if window:
             from data_engine import filter_market_lines_by_start_window
 
+            lo, hi = window
             market_lines, excluded_window = filter_market_lines_by_start_window(
-                market_lines, game_date, within_hours=SCAN_WITHIN_HOURS
+                market_lines, game_date, within_hours=hi / 60.0, min_lead_minutes=lo
             )
             if excluded_window:
                 console.print(
-                    f"[dim]Entry window: excluded {len(excluded_window)} game(s) not starting within "
-                    f"{SCAN_WITHIN_HOURS:g}h; {len(market_lines)} market(s) remain.[/dim]\n"
+                    f"[dim]Entry window: excluded {len(excluded_window)} game(s) not tipping in "
+                    f"{lo:g}–{hi:g} min; {len(market_lines)} market(s) remain.[/dim]\n"
                 )
             if not market_lines:
-                _warn(f"No markets starting within {SCAN_WITHIN_HOURS:g}h (SCAN_WITHIN_HOURS).")
+                _warn(f"No markets tipping in {lo:g}–{hi:g} min (SCAN_TIP_WINDOW_MIN).")
                 raise typer.Exit(0)
 
         console.print(f"Found {len(market_lines)} rebound markets on Kalshi (pre-game only)\n")
@@ -568,7 +571,9 @@ def scan(
             _warn(f"Dry run — no orders placed ({n_paper} new paper order(s) journaled). Use --live to execute.")
             if auto_mark and n_paper:
                 _schedule_marks(game_date, signals, tip_epoch_by_ticker(market_lines, game_date), paper=True)
-            _email_scan_summary(game_date, signals, total_xp, results=None)
+            # Scans run every 10 minutes: email only when this one journaled something new.
+            if n_paper:
+                _email_scan_summary(game_date, signals, total_xp, results=None)
     finally:
         if not dry_run:
             _sweep_resting_orders(client, game_date, series_ticker, keep)

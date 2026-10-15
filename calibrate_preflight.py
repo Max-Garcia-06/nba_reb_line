@@ -144,6 +144,32 @@ def latest_completed_game_date(engine, *, today: str) -> str | None:
     return str(d)[:10] if d else None
 
 
+# Enabled feature groups read nightly-backfilled tables; trading on a stale one prices
+# tonight with features that stopped updating.
+GROUP_TABLES = {"tracking": ("tracking_daily", "GAME_DATE"), "lineup": ("starters", "GAME_DATE"),
+                "inactive": ("lineups", "GAME_DATE"), "game_market": ("kalshi_game_markets", "game_date")}
+GROUP_MAX_LAG_DAYS = 3
+
+
+def group_data_lag_days(engine, today: str, groups) -> dict[str, int | None]:
+    """Days each enabled group's table trails the newest completed game (None: table empty/missing)."""
+    from sqlalchemy import inspect, text
+
+    expected = latest_completed_game_date(engine, today=today)
+    out: dict[str, int | None] = {}
+    for g in groups:
+        if g not in GROUP_TABLES or not expected:
+            continue
+        table, col = GROUP_TABLES[g]
+        have = None
+        if inspect(engine).has_table(table):
+            with engine.connect() as conn:
+                have = conn.execute(text(f"SELECT MAX({col}) FROM {table}")).scalar()
+        out[g] = None if not have else (datetime.strptime(expected, "%Y-%m-%d")
+                                         - datetime.strptime(str(have)[:10], "%Y-%m-%d")).days
+    return out
+
+
 def _latest_completed_scheduled_date() -> str | None:
     """What the DB should already hold: the newest completed game date before today (ET)."""
     from zoneinfo import ZoneInfo
@@ -217,6 +243,20 @@ def check_calibrate_preflight(*, live: bool = False) -> CalibratePreflightResult
     expected, have = _latest_completed_scheduled_date(), _latest_game_date()
     if expected and have and have < expected:
         _flag(f"player_gamelogs ends {have} but games were scheduled through {expected}; run etl")
+    if expected:
+        from zoneinfo import ZoneInfo
+
+        from data_engine import _get_engine
+        from feature_store import ENABLED_GROUPS
+
+        today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        for g, lag in group_data_lag_days(_get_engine(), today, ENABLED_GROUPS).items():
+            if lag is None:
+                _flag(f"Feature group '{g}' is enabled but {GROUP_TABLES[g][0]} is empty; run its backfill")
+            elif lag > GROUP_MAX_LAG_DAYS:
+                _flag(f"Feature group '{g}': {GROUP_TABLES[g][0]} is {lag}d behind the schedule; run its backfill")
+            elif lag >= 1:
+                warnings.append(f"Feature group '{g}': {GROUP_TABLES[g][0]} is {lag}d behind (backfills lag a day)")
 
     from model import get_model_trained_on
 

@@ -188,6 +188,11 @@ DISTRIBUTION = os.getenv("DISTRIBUTION", "nbinom")
 # slate). Tightened 2 → 1.5 on 2026-07-06: fills marked 120m later showed -0.107/contract CLV
 # vs +0.021 at 30m — early entries were getting run over by later lineup/pitcher info.
 SCAN_WITHIN_HOURS = float(os.getenv("SCAN_WITHIN_HOURS", "1.5"))
+# Scheduled scans: only games tipping in (lo, hi] minutes, as "lo,hi". Lineups are confirmed
+# ~60-70 min before tip, so the window sits after confirmation; orders expire at tip − 60 s.
+# Empty string falls back to SCAN_WITHIN_HOURS (manual full-slate scans).
+_tw = os.getenv("SCAN_TIP_WINDOW_MIN", "5,60").strip()
+SCAN_TIP_WINDOW_MIN = tuple(float(x) for x in _tw.split(",")) if _tw else None
 
 # Segment health (segment-report go/no-go)
 SEGMENT_MIN_FILLS = int(os.getenv("SEGMENT_MIN_FILLS", "5"))

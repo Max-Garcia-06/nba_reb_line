@@ -81,3 +81,15 @@ def test_line_ll_rows_matches_score():
     feat = pd.DataFrame({"reb_roll": rng.uniform(2, 12, 30), "reb_ewm": np.nan})
     lf = line_frame(feat)
     assert line_ll_rows(pmf, y, lf).mean() == pytest.approx(score(pmf, y, lf)["ll_line"])
+
+
+def test_group_data_lag_days(tmp_path):
+    import calibrate_preflight as cp
+    from sqlalchemy import create_engine
+
+    eng = create_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
+    pd.DataFrame({"GAME_ID": ["0022500001", "0022500002"], "GAME_DATE_EST": ["2026-03-01", "2026-03-05"]}
+                 ).to_sql("schedule", eng, index=False)
+    pd.DataFrame({"GAME_DATE": ["2026-03-01"]}).to_sql("tracking_daily", eng, index=False)
+    lags = cp.group_data_lag_days(eng, today="2026-03-06", groups=["tracking", "lineup", "travel"])
+    assert lags == {"tracking": 4, "lineup": None}

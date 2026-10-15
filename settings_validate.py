@@ -52,6 +52,7 @@ def validate_settings() -> SettingsValidation:
             MAX_OPEN_RESTING_PCT,
             MIN_BLEND_WEIGHT,
             MIN_LIMIT_PRICE,
+            SCAN_TIP_WINDOW_MIN,
             SCAN_WITHIN_HOURS,
         )
     except Exception as e:
@@ -105,6 +106,9 @@ def validate_settings() -> SettingsValidation:
         errors.append(f"MIN_LIMIT_PRICE must be in (0,1), got {MIN_LIMIT_PRICE}")
     if SCAN_WITHIN_HOURS < 0:
         errors.append(f"SCAN_WITHIN_HOURS must be >= 0, got {SCAN_WITHIN_HOURS}")
+    if SCAN_TIP_WINDOW_MIN is not None and not (
+            len(SCAN_TIP_WINDOW_MIN) == 2 and 0 <= SCAN_TIP_WINDOW_MIN[0] < SCAN_TIP_WINDOW_MIN[1]):
+        errors.append(f"SCAN_TIP_WINDOW_MIN must be 'lo,hi' with 0 <= lo < hi, got {SCAN_TIP_WINDOW_MIN}")
     if LOSS_LIMIT_LOOKBACK_DAYS < 1:
         errors.append(f"LOSS_LIMIT_LOOKBACK_DAYS must be >= 1, got {LOSS_LIMIT_LOOKBACK_DAYS}")
     if urlparse(KALSHI_BASE_URL).netloc != urlparse(KALSHI_ORDER_URL).netloc:

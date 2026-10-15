@@ -147,6 +147,20 @@ def resolve_slate(market_lines: list, game_date: str) -> tuple[dict[str, SlateRo
     return out, rosters, unresolved
 
 
+LINEUP_GROUPS = {"lineup", "inactive"}
+
+
+def lineup_gate(resolved: dict[str, SlateRow], states, groups) -> tuple[set[str], list[str]]:
+    """Game ids that may be priced, and skip messages. With lineup/inactive features on, a game
+    is priced only once both lineups are confirmed (the features don't exist before that);
+    an unreadable lineups JSON confirms nothing."""
+    games = {r.game_id for r in resolved.values()}
+    if not (set(groups) & LINEUP_GROUPS):
+        return games, []
+    ok = {g for g in games if states and g in states and states[g].confirmed}
+    return ok, sorted(f"{t}: lineups not confirmed" for t, r in resolved.items() if r.game_id not in ok)
+
+
 class AbsencesUnavailable(RuntimeError):
     """No injury report could be read; teammate-vacuum features would silently be 0."""
 
@@ -185,8 +199,22 @@ def build_slate_predictions(
     ``require_absences`` (live trading) raises AbsencesUnavailable when no injury
     report can be read, instead of pricing with vacuum = 0.
     """
+    from feature_store import ENABLED_GROUPS
+
     resolved, rosters, unresolved = resolve_slate(market_lines, game_date)
     skipped = [f"{t}: unresolved player/game" for t in unresolved]
+    if not resolved:
+        return [], [], skipped
+
+    groups = set(ENABLED_GROUPS)
+    states = None
+    if groups & LINEUP_GROUPS:
+        import lineups
+
+        states = lineups.todays_lineups(game_date)
+    ok_games, gate_skips = lineup_gate(resolved, states, groups)
+    skipped += gate_skips
+    resolved = {t: r for t, r in resolved.items() if r.game_id in ok_games}
     if not resolved:
         return [], [], skipped
 
@@ -197,11 +225,24 @@ def build_slate_predictions(
         "OPP_TEAM_ID": r.opp_team_id, "GAME_ID": r.game_id, "GAME_DATE": game_date,
         "SEASON": season, "is_home": r.is_home, "is_playoffs": int(_is_playoffs(r.game_id)),
     } for r in uniq.values()])
-    absent, report_ok = absences_by_team(game_date, rosters, de.slate_schedule_index(game_date))
+    idx = de.slate_schedule_index(game_date)
+    absent, report_ok = absences_by_team(game_date, rosters, idx)
     if require_absences and not report_ok:
         raise AbsencesUnavailable(f"No official injury report readable for {game_date}")
+    if "inactive" in groups and states:
+        for gid in ok_games:
+            for team, pids in states[gid].inactive.items():
+                absent.setdefault(int(team), set()).update(pids)
+    live_starters = {gid: states[gid].starters for gid in ok_games} if "lineup" in groups and states else None
+    game_market = None
+    if "game_market" in groups:
+        import game_markets
+
+        game_market = pd.concat([game_markets.history_features(), game_markets.live_features(game_date, idx)],
+                                ignore_index=True)
     feats = build_feature_table(extra_rows=extra, absent_override=absent,
-                                current_team=de.current_team_by_player(game_date))
+                                current_team=de.current_team_by_player(game_date),
+                                live_starters=live_starters, game_market=game_market)
     feats = feats[feats["_live"]].set_index(["PLAYER_ID", "GAME_ID"])
 
     pmf = model.pmf(feats.reset_index())

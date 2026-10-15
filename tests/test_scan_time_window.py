@@ -85,3 +85,14 @@ def test_filter_market_lines_pregame_with_schedule_index():
     assert len(kept) == 2
     assert len(excluded) == 1
     assert excluded[0][1] == "DALDEN"
+
+
+def test_start_window_excludes_games_too_close_to_tip():
+    now = datetime(2026, 5, 24, 12, 0, 0, tzinfo=timezone.utc)
+    idx = {"BOSNYK": {"status": "Pre-Game", "start_utc": now + timedelta(minutes=3)},
+           "SASPHX": {"status": "Pre-Game", "start_utc": now + timedelta(minutes=30)}}
+    lines = [_Line("A", "KXNBAREB-26MAY24BOSNYK"), _Line("B", "KXNBAREB-26MAY24SASPHX")]
+    kept, excluded = filter_market_lines_by_start_window(
+        lines, "2026-05-24", within_hours=1.0, min_lead_minutes=5, now=now, schedule_index=idx)
+    assert [k.ticker for k in kept] == ["B"]
+    assert excluded[0][3] == "too_close"

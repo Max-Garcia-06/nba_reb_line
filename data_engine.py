@@ -381,11 +381,13 @@ def filter_market_lines_by_start_window(
     game_date: str,
     *,
     within_hours: float,
+    min_lead_minutes: float = 0.0,
     now: datetime | None = None,
     schedule_index: dict[str, dict] | None = None,
 ) -> tuple[list, list[tuple[str, str, str, str]]]:
     """
-    Keep only markets whose NBA game tips within ``within_hours`` of ``now`` (UTC).
+    Keep only markets whose NBA game tips within ``within_hours`` of ``now`` (UTC), and
+    at least ``min_lead_minutes`` from now (reason ``too_close`` otherwise).
 
     Returns ``(kept_lines, excluded)`` where each excluded entry is
     ``(event_ticker, matchup_slug, game_datetime_iso, reason)``.
@@ -434,6 +436,11 @@ def filter_market_lines_by_start_window(
             if et not in seen_events:
                 seen_events.add(et)
                 excluded.append((et, key, start_iso, "already_started"))
+            continue
+        if delta_sec < float(min_lead_minutes) * 60.0:
+            if et not in seen_events:
+                seen_events.add(et)
+                excluded.append((et, key, start_iso, "too_close"))
             continue
         if delta_sec > max_sec:
             if et not in seen_events:
