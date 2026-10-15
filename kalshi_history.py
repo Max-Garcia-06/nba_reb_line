@@ -182,7 +182,7 @@ def load_markets() -> pd.DataFrame:
 # Candles
 # ---------------------------------------------------------------------------
 
-def _candle_window(m: dict, tip_utc: str | None) -> tuple[int, int]:
+def _candle_window(m: dict, tip_utc: str | None, lookback_hours: int = LOOKBACK_HOURS) -> tuple[int, int]:
     """[max(open, tip-LOOKBACK), tip] — falls back to occurrence-3h when tip is unknown."""
     if tip_utc:
         end = _ts(tip_utc)
@@ -191,27 +191,35 @@ def _candle_window(m: dict, tip_utc: str | None) -> tuple[int, int]:
     else:
         # Postponed/rescheduled events can lack occurrence_time and a schedule match.
         end = _ts(m["close_time"])
-    start = max(_ts(m["open_time"]), end - LOOKBACK_HOURS * 3600)
+    start = max(_ts(m["open_time"]), end - lookback_hours * 3600)
     # Round to hour boundaries so the hourly candle that closes at tip is included.
     return start - start % 3600, end - end % 3600 + 3600
 
 
-def fetch_candles(ticker: str, start_ts: int, end_ts: int) -> list[dict]:
+def _pick(d: dict, key: str, suffix: str = "_dollars"):
+    """Historical candles use plain keys (dollars as numbers); the live series endpoint
+    uses ``<key>_dollars`` / ``<key>_fp`` strings."""
+    v = d.get(key)
+    return d.get(key + suffix) if v is None else v
+
+
+def fetch_candles(ticker: str, start_ts: int, end_ts: int, path: str | None = None) -> list[dict]:
     if end_ts <= start_ts:
         return []
-    data = _get(f"/historical/markets/{ticker}/candlesticks",
+    data = _get(path or f"/historical/markets/{ticker}/candlesticks",
                 {"start_ts": start_ts, "end_ts": end_ts, "period_interval": 60})
     out = []
     for c in data.get("candlesticks", []):
         bid, ask, px = c.get("yes_bid") or {}, c.get("yes_ask") or {}, c.get("price") or {}
+        last = _pick(px, "close")
         out.append({
             "ticker": ticker,
             "end_ts": int(c["end_period_ts"]),
-            "yes_bid": _f(bid.get("close")),
-            "yes_ask": _f(ask.get("close")),
-            "last_price": _f(px.get("close")) if px.get("close") is not None else _f(px.get("previous")),
-            "volume": _f(c.get("volume")),
-            "open_interest": _f(c.get("open_interest")),
+            "yes_bid": _f(_pick(bid, "close")),
+            "yes_ask": _f(_pick(ask, "close")),
+            "last_price": _f(last if last is not None else _pick(px, "previous")),
+            "volume": _f(_pick(c, "volume", "_fp")),
+            "open_interest": _f(_pick(c, "open_interest", "_fp")),
         })
     return out
 
@@ -226,12 +234,16 @@ def _tip_lookup() -> dict[tuple[str, str], str]:
     return {(r.GAME_DATE_EST, f"{r.AWAY_TRICODE}{r.HOME_TRICODE}"): r.TIP_UTC for r in sch.itertuples()}
 
 
-def backfill_candles(workers: int = 6, flush_every: int = 500) -> None:
+def backfill_candles(workers: int = 6, flush_every: int = 500, *, markets: pd.DataFrame | None = None,
+                     table: str = "kalshi_candles", done_table: str = "kalshi_candles_done",
+                     lookback_hours: int = LOOKBACK_HOURS, path_for=None) -> None:
+    """Fetch hourly candles for every market not yet in ``done_table`` (resumable).
+    ``path_for(market) -> str`` overrides the candlestick endpoint per market."""
     eng = _engine()
-    markets = load_markets()
+    markets = load_markets() if markets is None else markets
     done: set[str] = set()
-    if inspect(eng).has_table("kalshi_candles_done"):
-        done = set(pd.read_sql("SELECT ticker FROM kalshi_candles_done", eng)["ticker"])
+    if inspect(eng).has_table(done_table):
+        done = set(pd.read_sql(f"SELECT ticker FROM {done_table}", eng)["ticker"])
     todo = markets[~markets["ticker"].isin(done)].to_dict("records")
     tips = _tip_lookup()
     log.info(f"Candles: {len(done):,} done, {len(todo):,} to fetch ({workers} workers)")
@@ -243,15 +255,15 @@ def backfill_candles(workers: int = 6, flush_every: int = 500) -> None:
             return
         with eng.begin() as conn:
             if buf:
-                pd.DataFrame(buf).to_sql("kalshi_candles", conn, if_exists="append", index=False, chunksize=2000)
-            pd.DataFrame({"ticker": done_buf}).to_sql("kalshi_candles_done", conn, if_exists="append", index=False)
+                pd.DataFrame(buf).to_sql(table, conn, if_exists="append", index=False, chunksize=2000)
+            pd.DataFrame({"ticker": done_buf}).to_sql(done_table, conn, if_exists="append", index=False)
         buf.clear()
         done_buf.clear()
 
     def job(m):
         tip = tips.get((m["game_date"], m["teams_code"]))
-        s, e = _candle_window(m, tip)
-        return m["ticker"], fetch_candles(m["ticker"], s, e)
+        s, e = _candle_window(m, tip, lookback_hours)
+        return m["ticker"], fetch_candles(m["ticker"], s, e, path=path_for(m) if path_for else None)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(job, m) for m in todo]

@@ -125,6 +125,17 @@ def lineups_backfill(
     _success(f"Stored {lineups.backfill(start, end, refetch=refetch):,} rows in {lineups.TABLE}.")
 
 
+def game_markets_backfill(
+    workers: int = typer.Option(4, "--workers", help="Parallel candle fetchers (shared 5 req/s limit)."),
+):
+    """Kalshi game totals/spreads: refresh the market list and fetch missing hourly candles."""
+    import game_markets
+
+    _header("Game-market backfill (KXNBATOTAL, KXNBASPREAD)")
+    game_markets.backfill(workers=workers)
+    _success("Game-market candles up to date.")
+
+
 def train():
     _header("Phase 2 — Model Training")
     import model as m

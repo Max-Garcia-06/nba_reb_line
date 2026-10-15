@@ -154,6 +154,8 @@ def team_state(tg: pd.DataFrame, window: int = TEAM_WINDOW) -> pd.DataFrame:
         "dreb_pct": "t_dreb_pct",
         "fg3a_rate": "t_3pa_rate",
         "margin": "t_margin",
+        "PTS": "t_pts",
+        "o_PTS": "t_pts_allowed",
     }
     g = tg.groupby("TEAM_ID")
     st = tg[["TEAM_ID", "GAME_DATE"]].copy()
@@ -392,6 +394,7 @@ def build_feature_table(
     starters: Optional[pd.DataFrame] = None,
     live_starters: Optional[dict[str, set[int]]] = None,
     pregame_inactive: Optional[dict[tuple[str, int], set[int]]] = None,
+    game_market: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Parameters
@@ -419,6 +422,8 @@ def build_feature_table(
     pregame_inactive: {(GAME_ID, TEAM_ID): {PLAYER_ID}} on the lineups JSON Inactive list
                       before the decision time; the inactive group adds them to pregame_out
                       (default: lineups.pregame_inactive() when gamelogs come from SQLite).
+    game_market     : GAME_ID, mkt_total, mkt_home_margin for the game_market group (default:
+                      game_markets.history_features() when gamelogs come from SQLite).
     """
     groups = ENABLED_GROUPS if groups is None else sorted(set(groups))
     feature_cols = model_features(groups)
@@ -498,6 +503,8 @@ def build_feature_table(
     df["opp_dreb_pct"] = opp["t_dreb_pct"].values
     df["opp_3pa_rate"] = opp["t_3pa_rate"].values
     df["exp_margin_abs"] = np.abs(own["t_margin"].values - opp["t_margin"].values) / 2
+    df["_exp_total"] = ((own["t_pts"].values + opp["t_pts_allowed"].values) / 2
+                        + (opp["t_pts"].values + own["t_pts_allowed"].values) / 2)
 
     if "travel" in groups:
         import travel
@@ -509,6 +516,18 @@ def build_feature_table(
             opp = tf[["TEAM_ID", "GAME_ID", "sched_rest_days"]].rename(
                 columns={"TEAM_ID": "OPP_TEAM_ID", "sched_rest_days": "opp_rest_days"})
             df = df.merge(opp, on=["OPP_TEAM_ID", "GAME_ID"], how="left")
+
+    if "game_market" in groups:
+        if game_market is None and gamelogs is None:
+            from game_markets import history_features
+
+            game_market = history_features()
+        if game_market is not None and len(game_market):
+            gmf = game_market[["GAME_ID", "mkt_total", "mkt_home_margin"]].copy()
+            gmf["GAME_ID"] = gmf["GAME_ID"].astype(str)
+            df = df.merge(gmf.drop_duplicates("GAME_ID", keep="last"), on="GAME_ID", how="left")
+            df["mkt_spread_abs"] = df["mkt_home_margin"].abs()
+            df["mkt_total_resid"] = df["mkt_total"] - df["_exp_total"]
 
     # Teammate vacuum
     pool = gl[["TEAM_ID", "SEASON", "PLAYER_ID"]].drop_duplicates()
