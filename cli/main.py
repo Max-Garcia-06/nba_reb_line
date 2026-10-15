@@ -29,6 +29,7 @@ def validate_settings_callback() -> None:
 
 app.command()(cmd.etl)
 app.command("injury-backfill")(cmd.injury_backfill)
+app.command("tracking-backfill")(cmd.tracking_backfill)
 app.command()(cmd.train)
 app.command()(cmd.evaluate)
 app.command()(cmd.scan)

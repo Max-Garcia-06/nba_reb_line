@@ -204,6 +204,34 @@ def player_state(gl: pd.DataFrame, tg: pd.DataFrame, window: int = ROLLING_WINDO
     return st.drop(columns=["TEAM_ID", "SEASON"])
 
 
+TRACKING_SUM_COLS = ["MIN", "REB", "REB_CHANCES", "OREB_CHANCES", "REB_CONTEST", "REB_CHANCE_DEFER"]
+
+
+def tracking_state(td: pd.DataFrame, window: int = ROLLING_WINDOW) -> pd.DataFrame:
+    """Per-game rebound-tracking state AFTER each game (inclusive), like player_state."""
+    t = td.copy()
+    t["GAME_DATE"] = pd.to_datetime(t["GAME_DATE"]).dt.normalize()
+    t["PLAYER_ID"] = t["PLAYER_ID"].astype(int)
+    for c in TRACKING_SUM_COLS:
+        t[c] = pd.to_numeric(t[c], errors="coerce")
+    t = t.sort_values(["PLAYER_ID", "GAME_DATE"]).reset_index(drop=True)
+    g = t.groupby("PLAYER_ID")
+
+    def rsum(c):
+        return g[c].transform(lambda x: x.rolling(window, min_periods=3).sum())
+
+    st = t[["PLAYER_ID", "GAME_DATE"]].copy()
+    chances = rsum("REB_CHANCES").replace(0, np.nan)
+    st["reb_chances_roll"] = g["REB_CHANCES"].transform(lambda x: x.rolling(window, min_periods=3).mean())
+    st["reb_chances_ewm"] = g["REB_CHANCES"].transform(lambda x: x.ewm(halflife=EWM_HALFLIFE, min_periods=3).mean())
+    st["reb_chances36_roll"] = 36 * rsum("REB_CHANCES") / rsum("MIN").replace(0, np.nan)
+    st["reb_conv_roll"] = rsum("REB") / chances
+    st["reb_contest_pct_roll"] = rsum("REB_CONTEST") / rsum("REB").replace(0, np.nan)
+    st["reb_defer_rate_roll"] = rsum("REB_CHANCE_DEFER") / chances
+    st["oreb_chance_share_roll"] = rsum("OREB_CHANCES") / chances
+    return st
+
+
 # ---------------------------------------------------------------------------
 # As-of joins
 # ---------------------------------------------------------------------------
@@ -307,6 +335,7 @@ def build_feature_table(
     current_team: Optional[dict[int, int]] = None,
     groups: Optional[list[str]] = None,
     schedule: Optional[pd.DataFrame] = None,
+    tracking_daily: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Parameters
@@ -325,6 +354,8 @@ def build_feature_table(
     groups          : optional feature groups to attach (default: ENABLED_GROUPS).
     schedule        : schedule for the travel group; default loaded from SQLite when
                       gamelogs come from SQLite.
+    tracking_daily  : per-game rebound tracking for the tracking group (default: the
+                      tracking_daily table when gamelogs come from SQLite).
     """
     groups = ENABLED_GROUPS if groups is None else sorted(set(groups))
     feature_cols = model_features(groups)
@@ -361,6 +392,14 @@ def build_feature_table(
     df.loc[new_season, "games_in_season"] = 0
     df["games_in_season"] = df["games_in_season"].fillna(0)
     df["games_played"] = df["games_played"].fillna(0)
+
+    if "tracking" in groups:
+        if tracking_daily is None and gamelogs is None:
+            from nba_daily import TRACKING_TABLE, load_table
+
+            tracking_daily = load_table(TRACKING_TABLE)
+        if tracking_daily is not None and len(tracking_daily):
+            df = _asof(df, tracking_state(tracking_daily), by="PLAYER_ID")
 
     # Prior-season tracking + REB/G
     prev = trk.copy()
