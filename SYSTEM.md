@@ -70,7 +70,7 @@ earlier dates. Tonight's scan rows go through the same function
 * Teammate vacuum: rotation teammates (≥15 trailing MPG, seen within 21 days,
   still on the team) known to be out before tip. Both history and live use the
   official NBA injury report (`injury_reports.py`, status Out) — history the latest
-  report ≥60 min before tip (`injury-backfill`, stored in `injury_reports`), live the
+  report ≥`DECISION_LEAD_MIN` before tip (`injury-backfill`, stored in `injury_reports`), live the
   newest report at scan time — plus players who have left the team (history: next
   game for another team; live: today's rosters) and `data/absent_<date>.json`.
   Games before report coverage (2025-26 coverage starts late Dec 2025) fall back to
@@ -83,6 +83,31 @@ earlier dates. Tonight's scan rows go through the same function
   players, 198 were Questionable/Doubtful players who then sat, 34 were ruled Out only
   after the cutoff, 100 never played again and 94 were traded; 10 were name misses
   (all traded players listed under their new team).
+
+### Decision time and feature groups
+
+`DECISION_LEAD_MIN` (default 30) is the point-in-time cutoff for every source with a
+publication time: history uses only what was published at or before tip − 30 min
+(injury reports, lineup timestamps, game-market candles). Live scans run 5–60 min
+before tip (`SCAN_TIP_WINDOW_MIN`), so 30 is the middle of the live window.
+
+Optional groups (`FEATURE_GROUPS`, all off until the ablation in §5 says otherwise;
+`FEATURE_VERSION` names the enabled set so caches never mix):
+
+| Group | Source | Point-in-time rule | History |
+|---|---|---|---|
+| `travel` | stored schedule + static arena table (`travel.py`) | schedule known in advance | all seasons |
+| `opp_vacuum` | same absence rules as the own-team vacuum, for the opponent | as vacuum | as vacuum |
+| `tracking` | `LeagueDashPtStats` Rebounding per game date (`tracking_daily`) | rolling state after each game, strictly earlier dates | all seasons |
+| `lineup` | box-score starters (`starters`) in history; confirmed lineups JSON live | start rate strictly earlier; tonight's starters only once confirmed | all seasons |
+| `inactive` | lineups JSON Inactive list (`lineups`), added to vacuum absences | row stamped ≤ tip − `DECISION_LEAD_MIN` | 2023-24, 2025-26 (2024-25 files are empty) |
+| `game_market` | Kalshi `KXNBATOTAL`/`KXNBASPREAD` ladders → median total, home margin (`game_markets.py`) | last hourly candle ending ≤ cutoff, ≤ 2 h old; NaN with < 3 two-sided lines | Oct 2025 onward |
+
+With `lineup` or `inactive` enabled, a live game is priced only once both teams'
+lineups are confirmed (five Confirmed starters each); an unreadable JSON confirms
+nothing. Models remember the feature list they were fit on; live preflight refuses
+a model whose list differs from the enabled one, and refuses once an enabled group's
+table trails the schedule by more than 3 days.
 
 Guards (`tests/test_feature_store_pit.py`): scrambling every outcome on/after
 date D must not move any feature dated ≤ D; live-path rows must equal history

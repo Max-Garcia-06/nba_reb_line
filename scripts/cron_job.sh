@@ -74,6 +74,18 @@ print(' '.join((today - timedelta(days=n)).isoformat() for n in range(1, ${RECON
 
 SCAN_LOG="${LOG_DIR}/scan.log"
 
+# Scans run every 10 minutes; never let two overlap (a slow stats.nba.com call can stretch one).
+scan_lock() {
+  local lock="${LOG_DIR}/.scan.lock"
+  if [[ -f "$lock" ]] && kill -0 "$(cat "$lock")" 2>/dev/null; then
+    echo "[$TS] [$JOB] previous scan (pid $(cat "$lock")) still running; skipping"
+    exit 0
+  fi
+  echo $$ >"$lock"
+  # Expand now: $lock is local and out of scope when the EXIT trap fires.
+  trap "rm -f '$lock'" EXIT
+}
+
 case "$JOB" in
   snapshot)
     # Pre-game tape for today's slate (feeds model-vs-market / refit-blend / backtest)
@@ -96,6 +108,16 @@ case "$JOB" in
     run_py etl --incremental || { etl_ok=0; log "etl failed — continuing; weekly retrain/refit skipped"; }
     # Official injury reports for yesterday's games (pre-tip absences for features).
     run_py injury-backfill --start "$YESTERDAY_ET" --end "$YESTERDAY_ET" || log "injury-backfill failed"
+    # Feature-group sources for the last few days (each skips dates already stored).
+    BACKFILL_START="$("$PYTHON" -c "
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+print((datetime.now(ZoneInfo('America/New_York')).date() - timedelta(days=${RECONCILE_LOOKBACK_DAYS})).isoformat())
+")"
+    run_py tracking-backfill --start "$BACKFILL_START" --end "$YESTERDAY_ET" || log "tracking-backfill failed"
+    run_py starters-backfill --start "$BACKFILL_START" --end "$YESTERDAY_ET" || log "starters-backfill failed"
+    run_py lineups-backfill --start "$BACKFILL_START" --end "$YESTERDAY_ET" || log "lineups-backfill failed"
+    run_py game-markets-backfill || log "game-markets-backfill failed"
     for d in $(recent_et_dates); do
       run_py reconcile --date "$d" || true
     done
@@ -132,6 +154,7 @@ case "$JOB" in
     run_py refit-blend
     ;;
   scan)
+    scan_lock
     # Dry-run edge scan — logs to scan.log, no orders placed
     log "START scan (dry-run) for $TODAY_ET"
     set +e
@@ -152,6 +175,7 @@ case "$JOB" in
     echo "[$TS] [scan-platt] EXIT $code"
     ;;
   scan-live)
+    scan_lock
     # Live scan — places orders on Kalshi
     log "START scan (LIVE) for $TODAY_ET"
     set +e

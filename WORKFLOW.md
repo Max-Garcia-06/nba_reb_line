@@ -28,8 +28,9 @@ Kalshi ◄──scan──────┘  slate.py: markets → (player, team, 
 |---|---|---|
 | Data | `etl [--incremental]` | `data/nba_reb.db` |
 | History | `python kalshi_history.py markets` / `candles`, `injury-backfill --start --end` | `kalshi_markets`, `kalshi_candles` (2025-26), `injury_reports` |
+| Feature sources | `tracking-backfill`, `starters-backfill`, `lineups-backfill` (`--start --end`), `game-markets-backfill` | `tracking_daily`, `starters`, `lineups`, `kalshi_game_markets` + `kalshi_game_candles` |
 | Model | `train`, `evaluate` | model + OOF calibrator; walk-forward scores |
-| Research | `python bakeoff.py run/summary`, `python market_eval.py` | model zoo comparison; model vs Kalshi |
+| Research | `python bakeoff.py run/summary/ablation`, `python market_eval.py` | model zoo comparison; feature-group ablation; model vs Kalshi |
 | Markets | `snapshot`, `schedule-snapshots` | `data/snapshots/` |
 | Trade | `scan [--live]`, `mark`, `reconcile` | journal, execution ledger |
 | Review | `report`, `report-range`, `calibrate`, `segment-report` | P&L net of fees, calibrators, go/no-go |
@@ -89,12 +90,29 @@ he plays for the new one. Historical dates and API failures fall back to last-pl
 | When (ET) | What |
 |---|---|
 | 12:00–22:00 every 2h | `snapshot` (cron) |
-| 17:05–23:05 hourly | `scan` (dry-run cron; `scan-live` when trusted). Only games tipping within `SCAN_WITHIN_HOURS`=1.5 |
+| 11:00–23:50 every 10 min | `scan` (dry-run cron; `scan-live` when trusted). Only games tipping in `SCAN_TIP_WINDOW_MIN` (5–60 min); with the `lineup`/`inactive` groups on, only once both lineups are confirmed. Overlapping scans are skipped (lock). Dry-run emails only when new paper orders are journaled |
 | before tip, optional | `data/absent_YYYY-MM-DD.json` `{"OUT": ["Name", ...]}` to add late scratches the injury feed missed |
-| 04:30 (launchd) | `nightly`: `etl --incremental`, `injury-backfill` (yesterday), `reconcile` (3-day lookback), `report`; weekly (>6 days since last) also `train` + `refit-blend`. Steps run independently |
+| 04:30 (launchd) | `nightly`: `etl --incremental`, `injury-backfill` (yesterday), feature-source backfills (`tracking`/`starters`/`lineups`, 3-day lookback; `game-markets`), `reconcile` (3-day lookback), `report`; weekly (>6 days since last) also `train` + `refit-blend`. Steps run independently |
 
 Scan skips — never prices off the market — any market whose player can't be resolved to
 tonight's game or has fewer than `GAMES_FOR_LAMBDA_SANITY` games.
+
+`SCAN_TIP_WINDOW_MIN=` (empty) falls back to `SCAN_WITHIN_HOURS` for a manual full-slate scan.
+
+Feature groups (`FEATURE_GROUPS`, comma-separated: `travel`, `opp_vacuum`, `tracking`,
+`lineup`, `inactive`, `game_market`; default none) add optional features on top of the
+base list. The model records the list it was trained on and live preflight refuses a
+mismatch, so run `train` (then `refit-blend`) after any change to `FEATURE_GROUPS`.
+Live preflight also refuses once an enabled group's table trails the schedule by more
+than 3 days. Decide groups with the ablation:
+
+```bash
+for g in base travel opp_vacuum tracking lineup inactive game_market; do
+  FEATURE_GROUPS=$([ $g = base ] || echo $g) .venv/bin/python bakeoff.py features
+  FEATURE_GROUPS=$([ $g = base ] || echo $g) .venv/bin/python bakeoff.py run --models c7_ens_c4_c5 --tag $g
+done
+.venv/bin/python bakeoff.py ablation --model c7_ens_c4_c5 [--since-score 2025-12-01]
+```
 
 ## 5. Feedback loop (weekly)
 
