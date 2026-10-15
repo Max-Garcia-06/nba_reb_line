@@ -306,6 +306,7 @@ def build_feature_table(
     pregame_out: Optional[dict[tuple[str, int], set[int]]] = None,
     current_team: Optional[dict[int, int]] = None,
     groups: Optional[list[str]] = None,
+    schedule: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Parameters
@@ -322,6 +323,8 @@ def build_feature_table(
     apply_filters   : drop thin-history / low-minute rows (training population).
                       Extra rows are never filtered.
     groups          : optional feature groups to attach (default: ENABLED_GROUPS).
+    schedule        : schedule for the travel group; default loaded from SQLite when
+                      gamelogs come from SQLite.
     """
     groups = ENABLED_GROUPS if groups is None else sorted(set(groups))
     feature_cols = model_features(groups)
@@ -383,6 +386,17 @@ def build_feature_table(
     df["opp_dreb_pct"] = opp["t_dreb_pct"].values
     df["opp_3pa_rate"] = opp["t_3pa_rate"].values
     df["exp_margin_abs"] = np.abs(own["t_margin"].values - opp["t_margin"].values) / 2
+
+    if "travel" in groups:
+        import travel
+
+        sched = de.load_schedule() if schedule is None and gamelogs is None else schedule
+        if sched is not None and len(sched):
+            tf = travel.travel_features(sched)
+            df = df.merge(tf.drop(columns=["sched_rest_days"]), on=["TEAM_ID", "GAME_ID"], how="left")
+            opp = tf[["TEAM_ID", "GAME_ID", "sched_rest_days"]].rename(
+                columns={"TEAM_ID": "OPP_TEAM_ID", "sched_rest_days": "opp_rest_days"})
+            df = df.merge(opp, on=["OPP_TEAM_ID", "GAME_ID"], how="left")
 
     # Teammate vacuum
     pool = gl[["TEAM_ID", "SEASON", "PLAYER_ID"]].drop_duplicates()
