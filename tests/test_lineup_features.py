@@ -71,3 +71,19 @@ def test_unconfirmed_live_game_has_nan_lineup_features():
     live = _build(past, _starters_from(past), extra_rows=extra, live_starters={})
     live = live[live["_live"]]
     assert live["starts_tonight"].isna().all() and live["team_usual_starters_out"].isna().all()
+
+
+def test_starter_team_comes_from_gamelogs_not_starters_table():
+    """LeagueDashPlayerStats reports a traded player's CURRENT team; the game's team must come from gamelogs."""
+    gl = _synthetic_gamelogs()
+    st = _starters_from(gl)
+    traded = 100  # team 1's top player
+    st.loc[st["PLAYER_ID"] == traded, "TEAM_ID"] = 4  # as if he were traded to team 4 later
+    df = _build(gl, st)
+    mine = df[df["PLAYER_ID"] == traded]
+    s = set(zip(st["PLAYER_ID"], pd.to_datetime(st["GAME_DATE"])))
+    assert mine["starts_tonight"].tolist() == [float((traded, d) in s) for d in mine["GAME_DATE"]]
+    t4 = df[(df["TEAM_ID"] == 4)].drop_duplicates("GAME_ID")
+    assert pd.concat([_build(gl, _starters_from(gl)).drop_duplicates(["TEAM_ID", "GAME_ID"])
+                      .query("TEAM_ID == 4").set_index("GAME_ID")["team_usual_starters_out"]],
+                     axis=1).iloc[:, 0].equals(t4.set_index("GAME_ID")["team_usual_starters_out"])

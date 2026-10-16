@@ -247,9 +247,14 @@ def lineup_features(df: pd.DataFrame, gl: pd.DataFrame, starters: pd.DataFrame,
     team_usual_starters_out  of the team's 5 most frequent starters over its previous 10 games,
                              how many are not starting tonight
     """
-    st = starters.copy()
+    st = starters[["PLAYER_ID", "GAME_DATE"]].copy()
     st["GAME_DATE"] = pd.to_datetime(st["GAME_DATE"]).dt.normalize()
-    st["PLAYER_ID"], st["TEAM_ID"] = st["PLAYER_ID"].astype(int), st["TEAM_ID"].astype(int)
+    st["PLAYER_ID"] = st["PLAYER_ID"].astype(int)
+    # The starters endpoint reports a traded player's CURRENT team; take the team he
+    # played for from the game logs (starts with no box-score row are dropped).
+    played_for = gl[["PLAYER_ID", "GAME_DATE", "TEAM_ID"]].assign(
+        PLAYER_ID=lambda x: x["PLAYER_ID"].astype(int), TEAM_ID=lambda x: x["TEAM_ID"].astype(int))
+    st = st.merge(played_for, on=["PLAYER_ID", "GAME_DATE"], how="inner")
     covered = set(st["GAME_DATE"])
     started = set(zip(st["PLAYER_ID"], st["GAME_DATE"]))
 
