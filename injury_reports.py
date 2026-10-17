@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable
@@ -42,6 +43,8 @@ TABLE = "injury_reports"
 NOT_SUBMITTED = "NOT YET SUBMITTED"
 OUT_STATUSES = {"out"}
 STEP_MIN = 15
+RETRIES = 3
+RETRY_SLEEP_S = 5.0
 
 # Column left edges (x0, points) in the 2025-26 layout; recomputed from the header when present.
 _DEFAULT_COLS = {"date": 0, "time": 110, "matchup": 195, "team": 258, "player": 420, "status": 580, "reason": 660}
@@ -192,6 +195,17 @@ def _floor_step(ts: datetime) -> datetime:
     return ts.replace(minute=ts.minute - ts.minute % STEP_MIN, second=0, microsecond=0)
 
 
+def _get(session, url: str):
+    """GET with retries on timeouts and dropped connections."""
+    for attempt in range(1, RETRIES + 1):
+        try:
+            return session.get(url, timeout=30)
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == RETRIES:
+                raise
+            time.sleep(RETRY_SLEEP_S)
+
+
 def fetch_report(ts_et: datetime, cache_dir: Path = CACHE_DIR, session: requests.Session | None = None) -> Path | None:
     """Download (or reuse) the report published at ``ts_et``; None when it does not exist."""
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -202,7 +216,7 @@ def fetch_report(ts_et: datetime, cache_dir: Path = CACHE_DIR, session: requests
     if missing.exists():
         return None
     for url in _report_urls(ts_et):
-        r = (session or requests).get(url, timeout=30)
+        r = _get(session or requests, url)
         if r.status_code == 200 and r.content[:4] == b"%PDF":
             path.write_bytes(r.content)
             return path
@@ -266,7 +280,11 @@ def backfill(start: str, end: str, *, lead_min: int, engine, schedule: pd.DataFr
     stored: set[datetime] = set()
     n = 0
     for cut in cutoffs:
-        found = latest_report_before(cut, cache_dir=cache_dir, session=session)
+        try:
+            found = latest_report_before(cut, cache_dir=cache_dir, session=session)
+        except requests.RequestException as e:  # skip, never fall back to an older report; a re-run fills it
+            log.warning("Could not fetch the injury report for %s: %s", cut, e)
+            continue
         if found is None:
             log.warning("No injury report found at or before %s", cut)
             continue

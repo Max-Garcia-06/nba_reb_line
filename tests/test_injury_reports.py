@@ -208,3 +208,47 @@ def test_pregame_out_default_lead_is_decision_lead(tmp_path, monkeypatch):
                        "GAME_ID": ["0022500800"], "GAME_DATE": pd.to_datetime(["2026-03-01"]), "SEASON": ["2025-26"]})
     assert ir.pregame_out_for_gamelogs(gl, engine=eng)[("0022500900", 10)] == {1}
     assert ir.pregame_out_for_gamelogs(gl, engine=eng, lead_min=60).get(("0022500900", 10), set()) == set()
+
+
+def test_fetch_retries_a_transient_timeout(tmp_path, monkeypatch):
+    import requests
+
+    import injury_reports as ir
+
+    monkeypatch.setattr(ir, "RETRY_SLEEP_S", 0)
+
+    class _Resp:
+        status_code, content = 200, b"%PDF-1.4"
+
+    class _S:
+        calls = 0
+
+        def get(self, url, timeout=30):
+            _S.calls += 1
+            if _S.calls == 1:
+                raise requests.ReadTimeout("slow")
+            return _Resp()
+
+    p = ir.fetch_report(datetime(2026, 3, 2, 17, 45), tmp_path, _S())
+    assert p is not None and _S.calls == 2
+
+
+def test_backfill_skips_a_cutoff_whose_fetch_keeps_failing(tmp_path, monkeypatch):
+    import requests
+    from sqlalchemy import create_engine
+
+    import injury_reports as ir
+
+    def fake_latest(cut, **kw):
+        if cut.hour == 18:
+            raise requests.ReadTimeout("slow")
+        return cut, tmp_path / f"{cut:%H%M}.pdf"
+
+    monkeypatch.setattr(ir, "latest_report_before", fake_latest)
+    monkeypatch.setattr(ir, "parse_pdf", lambda p: [{"game_date": "2026-03-02", "game_time": "10:00",
+                                                      "matchup": "HOU@WAS", "team": "HOU",
+                                                      "player_name": "Steven Adams", "status": "Out"}])
+    sched = pd.DataFrame({"GAME_DATE_EST": ["2026-03-02", "2026-03-02"],
+                          "TIP_UTC": ["2026-03-03T00:00:00Z", "2026-03-03T03:00:00Z"]})
+    eng = create_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
+    assert ir.backfill("2026-03-02", "2026-03-02", lead_min=60, engine=eng, schedule=sched, cache_dir=tmp_path) == 1
