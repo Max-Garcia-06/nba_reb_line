@@ -38,6 +38,7 @@ from nba_api.stats.endpoints import (
     playergamelogs,
     playerindex,
     scheduleleaguev2,
+    scoreboardv3,
 )
 
 from config import DB_PATH, SEASONS
@@ -267,9 +268,10 @@ def load_schedule() -> pd.DataFrame:
 # 5. Slate helpers for live scan (ported from mlb_tb_line; same contract)
 # ---------------------------------------------------------------------------
 
-# Schedule statuses where the game has started or finished (excluded from live scan).
-_STARTED_GAME_STATUSES = frozenset({"In Progress", "Final"})
+# Schedule statuses excluded from live scan: started, finished or postponed.
+_STARTED_GAME_STATUSES = frozenset({"In Progress", "Final", "Postponed"})
 _STATUS_BY_CODE = {1: "Scheduled", 2: "In Progress", 3: "Final"}
+_LIVE_STATUS_TIMEOUT = 20
 
 _EVENT_MATCHUP_RE = re.compile(r"^KX[A-Z]+-\d{2}[A-Z]{3}\d{2}([A-Z]{3})([A-Z]{3})$")
 
@@ -298,12 +300,26 @@ def _parse_game_datetime_utc(raw: str) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
-def _live_status_by_game_id() -> dict[str, str]:
-    """Today's game statuses from the NBA live scoreboard (empty on failure)."""
+def _scoreboard_status(game: dict) -> str:
+    text_ = str(game.get("gameStatusText") or "").strip().lower()
+    if text_ == "ppd" or "postpon" in text_:
+        return "Postponed"
+    return _STATUS_BY_CODE.get(int(game["gameStatus"]), "")
+
+
+def _live_status_by_game_id(game_date: str) -> dict[str, str]:
+    """
+    Game statuses for ``game_date`` from stats.nba.com ScoreboardV3, only when it is
+    today (ET); other dates use the stored schedule. Empty on failure (one attempt: a
+    scan runs every 10 minutes and the stored schedule is the fallback).
+    """
+    if game_date != _today_et():
+        return {}
     try:
-        from nba_api.live.nba.endpoints import scoreboard
-        games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
-        return {str(g["gameId"]): _STATUS_BY_CODE.get(int(g["gameStatus"]), "") for g in games}
+        games = scoreboardv3.ScoreboardV3(
+            game_date=game_date, league_id="00", timeout=_LIVE_STATUS_TIMEOUT,
+        ).get_dict()["scoreboard"]["games"]
+        return {str(g["gameId"]): _scoreboard_status(g) for g in games}
     except Exception as e:
         log.warning(f"live scoreboard unavailable ({e}); falling back to stored schedule status")
         return {}
@@ -324,7 +340,7 @@ def slate_schedule_index(game_date: str) -> dict[str, dict]:
         season = season_for_date(game_date)
         sch = fetch_schedule(season)
         sch = sch[sch["GAME_DATE_EST"] == game_date]
-    live = _live_status_by_game_id()
+    live = _live_status_by_game_id(game_date)
     out: dict[str, dict] = {}
     for r in sch.itertuples():
         status = live.get(str(r.GAME_ID)) or _STATUS_BY_CODE.get(int(r.GAME_STATUS or 1), "")
