@@ -42,6 +42,32 @@ def _email_scan_summary(game_date, signals, total_xp, results=None) -> None:
     send_email(subj, "\n".join(lines))
 
 
+def _scan_games(market_lines) -> list[str]:
+    """``AWY@HOM`` for each game among ``market_lines``, in first-seen order."""
+    from data_engine import parse_kalshi_event_matchup
+
+    out: list[str] = []
+    for ml in market_lines:
+        m = parse_kalshi_event_matchup(_event_ticker_from_ml(ml))
+        g = f"{m[0]}@{m[1]}" if m else "?"
+        if g not in out:
+            out.append(g)
+    return out
+
+
+def _text_scan_summary(state: dict, *, live: bool) -> None:
+    """Text a short summary of a scan that priced markets; never breaks the scan."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        from notify import format_scan_text, send_imessage
+
+        now_et = datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M")
+        send_imessage(format_scan_text(now_et=now_et, mode="LIVE" if live else "PAPER", **state))
+    except Exception as e:
+        log.warning(f"scan text not sent: {e}")
+
+
 def _event_ticker_from_ml(ml0) -> str:
     et = str(getattr(ml0, "event_ticker", "") or "")
     if not et and getattr(ml0, "ticker", ""):
@@ -297,6 +323,8 @@ def scan(
     # (ticker, side) pairs this scan wants resting. In live mode every exit path ends
     # with a sweep that cancels today's resting orders not in this set.
     keep: set[tuple[str, str]] = set()
+    # Filled once markets are priced; the finally block texts it (every exit after pricing).
+    text_state: dict | None = None
     try:
         if not dry_run:
             if kill_switch_active():
@@ -377,6 +405,8 @@ def scan(
         if not predictions:
             _warn("No markets could be matched to a player with enough history.")
             raise typer.Exit(0)
+        text_state = {"games": _scan_games(market_lines), "n_priced": len(predictions),
+                      "signals": [], "n_new": 0 if dry_run else None, "outcome": ""}
 
         prob_results = calculate_probabilities(predictions, distribution=meta.get("family", "pmf"))
         fill_calibrated_probabilities(prob_results)
@@ -501,6 +531,7 @@ def scan(
             _warn("No edges remained after sizing / contract filters.")
             raise typer.Exit(0)
 
+        text_state["signals"] = signals
         total_deployed = sum(s.bet_dollars for s in signals)
         console.print(f"\n[bold green]{len(signals)} edge(s) detected — ${total_deployed:.2f} total deployed:[/bold green]\n")
 
@@ -553,6 +584,7 @@ def scan(
             )
             if not risk.ok:
                 keep.clear()
+                text_state["outcome"] = f"Risk desk blocked: {risk.reason}"
                 console.print(f"[red]Risk desk blocked trading: {risk.reason}[/red]")
                 if risk.auto_killed:
                     console.print("[red]Kill switch activated.[/red]")
@@ -560,6 +592,7 @@ def scan(
             keep |= {(s.ticker, s.recommended_side) for s in signals}
             expiration_by_ticker = tip_epoch_by_ticker(market_lines, game_date)
             results = execute_signals(signals, client=client, expiration_by_ticker=expiration_by_ticker)
+            text_state["outcome"] = f"placed {sum(1 for r in results if r.success)}/{len(results)} ok"
             if auto_mark and results:
                 _schedule_marks(game_date, signals, expiration_by_ticker, paper=False)
             _email_scan_summary(game_date, signals, total_xp, results=results)
@@ -568,6 +601,7 @@ def scan(
             from paper_trading import record_paper_orders
 
             n_paper = record_paper_orders(game_date, signals)
+            text_state["n_new"] = n_paper
             _warn(f"Dry run — no orders placed ({n_paper} new paper order(s) journaled). Use --live to execute.")
             if auto_mark and n_paper:
                 _schedule_marks(game_date, signals, tip_epoch_by_ticker(market_lines, game_date), paper=True)
@@ -575,6 +609,8 @@ def scan(
             if n_paper:
                 _email_scan_summary(game_date, signals, total_xp, results=None)
     finally:
+        if text_state is not None:
+            _text_scan_summary(text_state, live=not dry_run)
         if not dry_run:
             _sweep_resting_orders(client, game_date, series_ticker, keep)
 

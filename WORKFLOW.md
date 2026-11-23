@@ -90,7 +90,7 @@ he plays for the new one. Historical dates and API failures fall back to last-pl
 | When (ET) | What |
 |---|---|
 | 12:00–22:00 every 2h | `snapshot` (cron) |
-| 11:00–23:50 every 10 min | `scan` (dry-run cron; `scan-live` when trusted). Only games tipping in `SCAN_TIP_WINDOW_MIN` (5–60 min); with the `lineup`/`inactive` groups on, only once both lineups are confirmed. Overlapping scans are skipped (lock). Dry-run emails only when new paper orders are journaled |
+| 11:00–23:50 every 10 min | `scan` (dry-run cron; `scan-live` when trusted). Only games tipping in `SCAN_TIP_WINDOW_MIN` (5–60 min); with the `lineup`/`inactive` groups on, only once both lineups are confirmed. Overlapping scans are skipped (lock). Dry-run emails only when new paper orders are journaled; every scan that priced markets texts a short summary via Messages.app when `IMESSAGE_RECIPIENT` is set |
 | 11:00–23:55 every 5 min | `mark` (cron): CLV/paper-fill marks for today's journals (paper and live) on wall-clock time. The sleepers a scan spawns stall while the Mac sleeps and fire after tip; this catches the 15m and close marks on the next run. The Mac must be awake (on AC, lid open) through the game window or scans and marks are skipped |
 | before tip, optional | `data/absent_YYYY-MM-DD.json` `{"OUT": ["Name", ...]}` to add late scratches the injury feed missed |
 | 04:30 (launchd) | `nightly`: `etl --incremental`, `injury-backfill` (yesterday), feature-source backfills (`tracking`/`starters`/`lineups`, 3-day lookback; `game-markets`), `reconcile` (3-day lookback), `report`; weekly (>6 days since last) also `train` + `refit-blend`. Steps run independently |

@@ -261,3 +261,8 @@ GMAIL_SENDER = os.getenv("GMAIL_SENDER", "")
 SCAN_EMAIL_RECIPIENT = os.getenv("SCAN_EMAIL_RECIPIENT", GMAIL_SENDER)
 SCAN_EMAIL_ENABLED = os.getenv("SCAN_EMAIL_ENABLED", "true").lower() in ("1", "true", "yes")
 
+# Per-scan iMessage summary (Messages.app on this Mac; phone number or Apple ID email).
+# Sent only for scans that priced markets. Empty recipient = off.
+IMESSAGE_RECIPIENT = os.getenv("IMESSAGE_RECIPIENT", "")
+SCAN_TEXT_ENABLED = os.getenv("SCAN_TEXT_ENABLED", "true").lower() in ("1", "true", "yes")
+
