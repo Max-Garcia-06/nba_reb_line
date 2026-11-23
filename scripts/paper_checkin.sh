@@ -19,6 +19,14 @@ OUT="${REPO_ROOT}/logs/paper_checkin_${END}.txt"
   grep "\[scan\] START" logs/scan.log | sed -E 's/^\[([0-9-]+) .*/\1/' \
     | awk -v s="$START" '$1 >= s' | sort | uniq -c
   echo
+  echo "== Scan texts sent per ET day (one per scan that priced markets) =="
+  grep "iMessage sent" logs/scan.log | cut -c1-10 | awk -v s="$START" '$1 >= s' | sort | uniq -c
+  echo
+  echo "== Nightly steps since ${START} (FAILED lines; none = all OK) =="
+  grep -E "^\[[0-9-]+ .*\] \[nightly\] (START|FAILED)" logs/cron.log | sed -E 's/^\[([0-9-]+) .*/\1/' \
+    | awk -v s="$START" '$1 >= s' | sort | uniq -c | sed 's/$/ nightly step(s) started/'
+  grep -E "\[nightly\] FAILED" logs/cron.log | awk -v s="[$START" '$1 >= s' || true
+  echo
   echo "== Paper journal (orders, mark rows by label, orders with a pre-tip mark) =="
   "$PYTHON" - "$START" <<'EOF'
 import collections, glob, json, os, sys
@@ -57,9 +65,10 @@ notify.send_email('nba_reb_line: paper trial check-in ${END}', open(sys.argv[1])
 " "$OUT"
 fi
 
-# One-shot when launched by its launchd agent: unload and remove it after running.
-if [[ "${XPC_SERVICE_NAME:-}" == "com.nba_reb_line.paper-checkin" ]]; then
-  PLIST="${HOME}/Library/LaunchAgents/com.nba_reb_line.paper-checkin.plist"
-  rm -f "$PLIST"
-  launchctl bootout "gui/$(id -u)/com.nba_reb_line.paper-checkin" 2>/dev/null || true
+# One-shot when launched by a com.nba_reb_line.paper-checkin* launchd agent: unload and
+# remove that agent after running.
+LABEL="${XPC_SERVICE_NAME:-}"
+if [[ "$LABEL" == com.nba_reb_line.paper-checkin* ]]; then
+  rm -f "${HOME}/Library/LaunchAgents/${LABEL}.plist"
+  launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
 fi
