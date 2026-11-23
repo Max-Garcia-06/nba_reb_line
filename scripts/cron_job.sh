@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run a single pipeline step for cron (logging, venv, ET dates).
-# Usage: scripts/cron_job.sh <snapshot|etl|reconcile|report|nightly|refit-blend|scan|scan-platt|scan-live>
+# Usage: scripts/cron_job.sh <snapshot|etl|reconcile|report|nightly|refit-blend|mark|scan|scan-platt|scan-live>
 
 set -euo pipefail
 
@@ -12,7 +12,7 @@ mkdir -p "$LOG_DIR"
 
 JOB="${1:-}"
 if [[ -z "$JOB" ]]; then
-  echo "Usage: $0 <snapshot|etl|reconcile|report|nightly|refit-blend|scan|scan-platt|scan-live>" >&2
+  echo "Usage: $0 <snapshot|etl|reconcile|report|nightly|refit-blend|mark|scan|scan-platt|scan-live>" >&2
   exit 1
 fi
 
@@ -152,6 +152,21 @@ print((datetime.now(ZoneInfo('America/New_York')).date() - timedelta(days=${RECO
     # Runs automatically as part of `nightly` once a week (see above); this case
     # remains for manual/ad-hoc re-fits.
     run_py refit-blend
+    ;;
+  mark)
+    # CLV/paper-fill marks on wall-clock time. The sleepers a scan spawns stall while
+    # the Mac sleeps (time.sleep pauses) and then fire after tip, when nothing is
+    # markable; this catches the 15m and close marks on the next run after a wake.
+    # mark is idempotent. Skip days with no journal to keep the log quiet.
+    for kind in paper live; do
+      if [[ "$kind" == paper ]]; then j="data/paper/trades_${TODAY_ET}.jsonl"; flag=(--paper); else j="data/trades_${TODAY_ET}.jsonl"; flag=(); fi
+      [[ -f "$j" ]] || continue
+      set +e
+      "$PYTHON" run_pipeline.py mark --date "$TODAY_ET" "${flag[@]+"${flag[@]}"}" >>"${LOG_DIR}/mark.log" 2>&1
+      code=$?
+      set -e
+      echo "[$TS] [mark] $kind EXIT $code"
+    done
     ;;
   scan)
     scan_lock
