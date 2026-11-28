@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 _MAX_TEXT_SIGNALS = 5
 _OSASCRIPT_TIMEOUT_SEC = 20
+# Without a timeout a socket left dead by Mac sleep blocks the scan (and its lock) forever.
+_SMTP_TIMEOUT_SEC = 30
 # Text and recipient arrive as argv, never spliced into the script source.
 _SEND_SCRIPT = (
     "on run argv\n"
@@ -76,7 +78,7 @@ def send_email(subject: str, body: str) -> None:
     msg["To"] = SCAN_EMAIL_RECIPIENT
 
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=_SMTP_TIMEOUT_SEC) as smtp:
             smtp.starttls()
             smtp.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
             smtp.send_message(msg)
