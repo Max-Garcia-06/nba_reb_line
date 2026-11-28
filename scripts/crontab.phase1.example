@@ -28,5 +28,4 @@ PATH=/usr/local/bin:/usr/bin:/bin
 */10 8-20 * * * TZ=America/New_York @@REPO@@/scripts/cron_job.sh scan >> @@REPO@@/logs/scan.log 2>&1
 */5 8-20 * * * TZ=America/New_York @@REPO@@/scripts/cron_job.sh mark >> @@REPO@@/logs/mark.log 2>&1
 
-# Watchdog: kill scan processes stuck >3h
-*/20 * * * * @@REPO@@/scripts/kill_stuck_scans.sh >> @@REPO@@/logs/cron.log 2>&1
+# Hung scans: cron_job.sh scan_lock kills a scan holding the lock > SCAN_MAX_MIN (25).
