@@ -114,6 +114,12 @@ scan_lock() {
   trap "[[ \"\$(cut -d' ' -f1 '$lock' 2>/dev/null)\" == $$ ]] && rm -f '$lock'; true" EXIT
 }
 
+# Text a warning (max once an hour) while scans run on battery: unplugged, the Mac
+# sleeps when the lid closes and scans stop. Never fails the scan.
+battery_check() {
+  "$PYTHON" power_warning.py 2>&1 || true
+}
+
 case "$JOB" in
   snapshot)
     # Pre-game tape for today's slate (feeds model-vs-market / refit-blend / backtest)
@@ -197,6 +203,7 @@ print((datetime.now(ZoneInfo('America/New_York')).date() - timedelta(days=${RECO
     done
     ;;
   scan)
+    battery_check
     scan_lock
     # Dry-run edge scan — logs to scan.log, no orders placed
     log "START scan (dry-run) for $TODAY_ET"
@@ -218,6 +225,7 @@ print((datetime.now(ZoneInfo('America/New_York')).date() - timedelta(days=${RECO
     echo "[$TS] [scan-platt] EXIT $code"
     ;;
   scan-live)
+    battery_check
     scan_lock
     # Live scan — places orders on Kalshi
     log "START scan (LIVE) for $TODAY_ET"

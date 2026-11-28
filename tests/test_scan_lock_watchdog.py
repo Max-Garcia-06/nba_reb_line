@@ -17,6 +17,7 @@ REPO = Path(__file__).resolve().parents[1]
 
 FAKE_PYTHON = f"""#!/usr/bin/env bash
 if [[ "$1" == "-c" ]]; then exec {sys.executable} "$@"; fi
+[[ "$1" == run_pipeline.py ]] || exit 0  # battery check etc.: no-op
 exec sleep "${{FAKE_SCAN_SLEEP:-0}}"
 """
 
