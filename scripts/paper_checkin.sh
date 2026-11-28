@@ -22,6 +22,13 @@ OUT="${REPO_ROOT}/logs/paper_checkin_${END}.txt"
   echo "== Scan texts sent per ET day (one per scan that priced markets) =="
   grep "iMessage sent" logs/scan.log | cut -c1-10 | awk -v s="$START" '$1 >= s' | sort | uniq -c
   echo
+  echo "== Scans skipped behind a running scan / hung scans killed (both should stay near 0) =="
+  for pat in "still running; skipping" "hung for .*killing it"; do
+    n="$(grep -hE "$pat" logs/scan.log logs/cron.log 2>/dev/null | sed -E 's/^\[([0-9-]+) .*/\1/' \
+      | awk -v s="$START" '$1 >= s' | wc -l | tr -d ' ')"
+    echo "  ${n}  ${pat//.\*/…}"
+  done
+  echo
   echo "== Nightly steps since ${START} (FAILED lines; none = all OK) =="
   grep -E "^\[[0-9-]+ .*\] \[nightly\] (START|FAILED)" logs/cron.log | sed -E 's/^\[([0-9-]+) .*/\1/' \
     | awk -v s="$START" '$1 >= s' | sort | uniq -c | sed 's/$/ nightly step(s) started/'
