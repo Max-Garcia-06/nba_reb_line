@@ -75,15 +75,43 @@ print(' '.join((today - timedelta(days=n)).isoformat() for n in range(1, ${RECON
 SCAN_LOG="${LOG_DIR}/scan.log"
 
 # Scans run every 10 minutes; never let two overlap (a slow stats.nba.com call can stretch one).
+# Lock file holds "<pid> <start epoch>". A holder older than SCAN_MAX_MIN is treated as hung
+# (on 2026-11-27 one blocked 4.5h on a socket left dead by Mac sleep and skipped every later
+# scan): its python child is killed and this scan runs. Only the scan's direct child is
+# killed, so the mark sleepers it spawned keep their schedule.
+SCAN_MAX_MIN="${SCAN_MAX_MIN:-25}"
+
+# Running and not a zombie (kill -0 also succeeds for an unreaped zombie).
+pid_alive() {
+  local st
+  st="$(ps -o stat= -p "$1" 2>/dev/null)" && [[ -n "$st" && "$st" != Z* ]]
+}
+
 scan_lock() {
   local lock="${LOG_DIR}/.scan.lock"
-  if [[ -f "$lock" ]] && kill -0 "$(cat "$lock")" 2>/dev/null; then
-    echo "[$TS] [$JOB] previous scan (pid $(cat "$lock")) still running; skipping"
-    exit 0
+  local holder="" started="" age
+  [[ -f "$lock" ]] && read -r holder started <"$lock" || true
+  if [[ -n "$holder" ]] && pid_alive "$holder"; then
+    # Old pid-only locks: fall back to the file's mtime (BSD stat, then GNU).
+    started="${started:-$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock")}"
+    age=$(( $(date +%s) - started ))
+    if (( age < SCAN_MAX_MIN * 60 )); then
+      echo "[$TS] [$JOB] previous scan (pid $holder) still running; skipping"
+      exit 0
+    fi
+    echo "[$TS] [$JOB] previous scan (pid $holder) hung for $(( age / 60 ))m; killing it"
+    pkill -TERM -P "$holder" 2>/dev/null || true
+    local i
+    for i in $(seq 1 20); do pid_alive "$holder" || break; sleep 0.5; done
+    if pid_alive "$holder"; then
+      pkill -KILL -P "$holder" 2>/dev/null || true
+      kill -KILL "$holder" 2>/dev/null || true
+    fi
   fi
-  echo $$ >"$lock"
-  # Expand now: $lock is local and out of scope when the EXIT trap fires.
-  trap "rm -f '$lock'" EXIT
+  echo "$$ $(date +%s)" >"$lock"
+  # Expand now: $lock is local and out of scope when the EXIT trap fires. Remove the
+  # lock only while it is still ours, so a killed holder can't drop a newer scan's lock.
+  trap "[[ \"\$(cut -d' ' -f1 '$lock' 2>/dev/null)\" == $$ ]] && rm -f '$lock'; true" EXIT
 }
 
 case "$JOB" in
